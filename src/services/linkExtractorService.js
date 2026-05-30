@@ -1,0 +1,189 @@
+const IMAGE_EXTENSION_PATTERN = /\.(avif|gif|jpe?g|png|webp)(\?.*)?$/i;
+const URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function stripTrailingPunctuation(url) {
+  return url.replace(/[),.;\]]+$/g, "");
+}
+
+function getMessageText(message) {
+  return message.text || message.caption || "";
+}
+
+function isForwarded(message) {
+  return Boolean(message.forward_origin || message.forward_from || message.forward_sender_name || message.forward_date);
+}
+
+function getLargestPhoto(message) {
+  const photos = message.photo || [];
+  return photos[photos.length - 1] || null;
+}
+
+function isDirectImageUrl(url) {
+  return IMAGE_EXTENSION_PATTERN.test(url);
+}
+
+async function isImageByContentType(url) {
+  try {
+    const response = await fetchWithTimeout(url, {
+      method: "HEAD",
+      headers: {
+        "User-Agent": "AniSeekBot/1.0"
+      },
+      redirect: "follow"
+    });
+
+    return response.headers.get("content-type")?.toLowerCase().startsWith("image/") || false;
+  } catch {
+    return false;
+  }
+}
+
+function classifyHost(url) {
+  const host = new URL(url).hostname.replace(/^www\./, "").toLowerCase();
+
+  if (host === "reddit.com" || host.endsWith(".reddit.com") || host === "redd.it") {
+    return "reddit";
+  }
+
+  if (host === "twitter.com" || host === "x.com" || host.endsWith(".twitter.com")) {
+    return "twitter";
+  }
+
+  if (host === "facebook.com" || host === "fb.watch" || host.endsWith(".facebook.com")) {
+    return "facebook";
+  }
+
+  return "direct_url";
+}
+
+async function fetchHtml(url) {
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      Accept: "text/html,application/xhtml+xml",
+      "User-Agent": "Mozilla/5.0 AniSeekBot/1.0"
+    },
+    redirect: "follow"
+  });
+
+  if (!response.ok) {
+    throw new Error(`Could not fetch page metadata (${response.status}).`);
+  }
+
+  return response.text();
+}
+
+function extractMetaImage(html) {
+  const patterns = [
+    /<meta[^>]+property=["']og:image(?::secure_url)?["'][^>]+content=["']([^"']+)["'][^>]*>/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image(?::secure_url)?["'][^>]*>/i,
+    /<meta[^>]+name=["']twitter:image(?::src)?["'][^>]+content=["']([^"']+)["'][^>]*>/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image(?::src)?["'][^>]*>/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) {
+      return match[1].replace(/&amp;/g, "&");
+    }
+  }
+
+  return null;
+}
+
+async function resolveSocialImage(url) {
+  const html = await fetchHtml(url);
+  const imageUrl = extractMetaImage(html);
+
+  if (!imageUrl) {
+    throw new Error("No image preview was found on that page.");
+  }
+
+  return new URL(imageUrl, url).toString();
+}
+
+function ensureSocialEnabled(source, settings) {
+  if (source === "reddit" && !settings.enableReddit) {
+    throw new Error("Reddit links are disabled by the current settings.");
+  }
+
+  if (source === "twitter" && !settings.enableTwitter) {
+    throw new Error("Twitter/X links are disabled by the current settings.");
+  }
+
+  if (source === "facebook" && !settings.enableFacebook) {
+    throw new Error("Facebook links are disabled by the current settings.");
+  }
+}
+
+export function extractUrls(message) {
+  return [...getMessageText(message).matchAll(URL_PATTERN)].map((match) => stripTrailingPunctuation(match[0]));
+}
+
+export async function resolveImageInput(message, bot, settings) {
+  const photo = getLargestPhoto(message);
+
+  if (photo) {
+    return {
+      source: isForwarded(message) ? "forwarded_image" : "telegram_image",
+      inputUrl: null,
+      imageUrl: await bot.getFileLink(photo.file_id)
+    };
+  }
+
+  if (message.document?.mime_type?.startsWith("image/") && message.document.file_id) {
+    return {
+      source: isForwarded(message) ? "forwarded_image" : "telegram_image",
+      inputUrl: null,
+      imageUrl: await bot.getFileLink(message.document.file_id)
+    };
+  }
+
+  const [url] = extractUrls(message);
+
+  if (!url) {
+    return null;
+  }
+
+  if (isDirectImageUrl(url)) {
+    return {
+      source: "direct_url",
+      inputUrl: url,
+      imageUrl: url
+    };
+  }
+
+  const source = classifyHost(url);
+  ensureSocialEnabled(source, settings);
+
+  if (source === "direct_url" && await isImageByContentType(url)) {
+    return {
+      source: "direct_url",
+      inputUrl: url,
+      imageUrl: url
+    };
+  }
+
+  if (source === "direct_url") {
+    throw new Error("Please send a direct image URL or a URL that returns image content.");
+  }
+
+  return {
+    source,
+    inputUrl: url,
+    imageUrl: await resolveSocialImage(url)
+  };
+}
