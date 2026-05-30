@@ -18,13 +18,32 @@ function toDate(value) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function getDailyLimit(user, settings) {
-  const override = Number(user.dailyLimitOverride);
-  if (Number.isFinite(override) && override >= 0) {
-    return Math.floor(override);
+function parseNonNegativeInteger(value, fallback = null) {
+  if (value === null || value === undefined || value === "") {
+    return fallback;
   }
 
-  return Math.floor(Number(settings.dailyLimit) || 0);
+  const numericValue = typeof value === "number" ? value : Number(String(value).trim());
+
+  if (!Number.isFinite(numericValue) || numericValue < 0) {
+    return fallback;
+  }
+
+  return Math.floor(numericValue);
+}
+
+export function resolveDailyLimit(user, settings) {
+  const override = parseNonNegativeInteger(user.dailyLimitOverride);
+
+  if (override !== null) {
+    return override;
+  }
+
+  return parseNonNegativeInteger(settings.dailyLimit, 0);
+}
+
+function resolveDailyUsed(user) {
+  return parseNonNegativeInteger(user.dailyUsed, 0);
 }
 
 export async function prepareUserDailyWindow(user) {
@@ -78,22 +97,24 @@ export async function checkAnalysisAccess(user, settings) {
     };
   }
 
-  const dailyLimit = getDailyLimit(normalizedUser, settings);
-  const dailyUsed = Number(normalizedUser.dailyUsed) || 0;
+  const dailyLimit = resolveDailyLimit(normalizedUser, settings);
+  const dailyUsed = resolveDailyUsed(normalizedUser);
 
   if (dailyUsed >= dailyLimit) {
     return {
       allowed: false,
       dailyLimit,
+      dailyUsed,
       remaining: 0,
-      reason: `Daily limit reached (${dailyLimit}/${dailyLimit}).`
+      reason: `Daily limit reached (${dailyUsed}/${dailyLimit}).`
     };
   }
 
   return {
     allowed: true,
     dailyLimit,
-    remaining: dailyLimit - dailyUsed
+    dailyUsed,
+    remaining: Math.max(0, dailyLimit - dailyUsed)
   };
 }
 
@@ -105,7 +126,7 @@ export async function incrementDailyUsage(telegramId) {
     const snapshot = await transaction.get(ref);
     const data = snapshot.exists ? snapshot.data() : {};
     const sameDay = data.dailyUsedDate === currentDay;
-    const currentUsed = sameDay ? Number(data.dailyUsed) || 0 : 0;
+    const currentUsed = sameDay ? resolveDailyUsed(data) : 0;
 
     transaction.set(
       ref,

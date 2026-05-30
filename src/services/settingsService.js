@@ -10,7 +10,12 @@ function asBoolean(value, fallback) {
 }
 
 function asNumber(value, fallback, { min = 0, max = Number.POSITIVE_INFINITY } = {}) {
-  const numberValue = Number(value);
+  if (value === null || value === undefined || value === "") {
+    return fallback;
+  }
+
+  const numberValue = typeof value === "number" ? value : Number(String(value).trim());
+
   if (!Number.isFinite(numberValue)) {
     return fallback;
   }
