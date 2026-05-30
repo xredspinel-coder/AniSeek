@@ -43,6 +43,19 @@ function getLargestPhoto(message) {
   return photos[photos.length - 1] || null;
 }
 
+async function getTelegramFileUrl(bot, fileId) {
+  const file = await bot.getFile(fileId);
+
+  if (!file?.file_path) {
+    throw new InputResolutionError("Could not resolve Telegram file URL.", {
+      status: "failed",
+      rejectionReason: "api_error"
+    });
+  }
+
+  return `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
+}
+
 function isDirectImageUrl(url) {
   return IMAGE_EXTENSION_PATTERN.test(url);
 }
@@ -168,13 +181,15 @@ export async function resolveImageInput(message, bot, settings) {
   const photo = getLargestPhoto(message);
 
   if (photo) {
-    const imageUrl = await bot.getFileLink(photo.file_id);
+    const imageUrl = await getTelegramFileUrl(bot, photo.file_id);
 
     return {
       source: isForwarded(message) ? "forwarded_image" : "telegram_image",
       inputType: isForwarded(message) ? "telegram_forward" : "image",
       inputUrl: null,
       inputFileId: photo.file_id,
+      inputTelegramFileUrl: imageUrl,
+      inputImageUrl: imageUrl,
       inputThumbnail: imageUrl,
       inputPreview: imageUrl,
       imageUrl
@@ -182,16 +197,24 @@ export async function resolveImageInput(message, bot, settings) {
   }
 
   if (message.document?.mime_type?.startsWith("image/") && message.document.file_id) {
-    const imageUrl = await bot.getFileLink(message.document.file_id);
-    const thumbnailUrl = message.document.thumbnail?.file_id
-      ? await bot.getFileLink(message.document.thumbnail.file_id)
-      : imageUrl;
+    const imageUrl = await getTelegramFileUrl(bot, message.document.file_id);
+    let thumbnailUrl = imageUrl;
+
+    if (message.document.thumbnail?.file_id) {
+      try {
+        thumbnailUrl = await getTelegramFileUrl(bot, message.document.thumbnail.file_id);
+      } catch {
+        thumbnailUrl = imageUrl;
+      }
+    }
 
     return {
       source: isForwarded(message) ? "forwarded_image" : "telegram_image",
       inputType: isForwarded(message) ? "telegram_forward" : "image",
       inputUrl: null,
       inputFileId: message.document.file_id,
+      inputTelegramFileUrl: imageUrl,
+      inputImageUrl: imageUrl,
       inputThumbnail: thumbnailUrl,
       inputPreview: imageUrl,
       imageUrl
@@ -210,6 +233,8 @@ export async function resolveImageInput(message, bot, settings) {
       inputType: "url",
       inputUrl: url,
       inputFileId: null,
+      inputTelegramFileUrl: null,
+      inputImageUrl: url,
       inputThumbnail: url,
       inputPreview: url,
       imageUrl: url
@@ -225,6 +250,8 @@ export async function resolveImageInput(message, bot, settings) {
       inputType: "url",
       inputUrl: url,
       inputFileId: null,
+      inputTelegramFileUrl: null,
+      inputImageUrl: url,
       inputThumbnail: url,
       inputPreview: url,
       imageUrl: url
@@ -257,6 +284,8 @@ export async function resolveImageInput(message, bot, settings) {
     inputType: source,
     inputUrl: url,
     inputFileId: null,
+    inputTelegramFileUrl: null,
+    inputImageUrl: imageUrl,
     inputThumbnail: imageUrl,
     inputPreview: imageUrl,
     imageUrl

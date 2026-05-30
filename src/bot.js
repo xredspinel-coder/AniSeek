@@ -71,6 +71,17 @@ function buildSuccessResponse(match) {
   };
 }
 
+function buildActivityMedia(input = {}, result = {}, sentMedia = {}) {
+  return {
+    inputImageUrl: input.inputImageUrl || input.inputPreview || input.inputThumbnail || null,
+    inputTelegramFileUrl: input.inputTelegramFileUrl || null,
+    resultImageUrl: result.imageUrl || result.resultImageUrl || null,
+    resultVideoUrl: result.videoUrl || result.resultVideoUrl || null,
+    botVideoUrl: sentMedia.botVideoUrl || null,
+    botImageUrl: sentMedia.botImageUrl || result.imageUrl || null
+  };
+}
+
 function buildResultMessage(match) {
   const lines = [
     `<b>${escapeHtml(match.animeTitle)}</b>`,
@@ -101,7 +112,10 @@ async function sendResult(chatId, match, settings) {
         caption,
         parse_mode: "HTML"
       });
-      return;
+      return {
+        botVideoUrl: match.videoUrl,
+        botImageUrl: match.imageUrl || null
+      };
     } catch (error) {
       console.warn("Telegram video preview failed, falling back to message.", error.message);
     }
@@ -111,6 +125,11 @@ async function sendResult(chatId, match, settings) {
     parse_mode: "HTML",
     disable_web_page_preview: false
   });
+
+  return {
+    botVideoUrl: null,
+    botImageUrl: match.imageUrl || null
+  };
 }
 
 async function handleAnalysis(message, user, settings) {
@@ -138,6 +157,7 @@ async function handleAnalysis(message, user, settings) {
         source: error.source,
         inputType: error.source
       }),
+      media: buildActivityMedia(),
       status,
       rejectionReason,
       botResponse,
@@ -171,6 +191,7 @@ async function handleAnalysis(message, user, settings) {
       source: "unknown",
       inputType: "unknown",
       userInput: buildUserInput(message),
+      media: buildActivityMedia(),
       status: "rejected",
       rejectionReason: "invalid_media",
       botResponse
@@ -207,6 +228,7 @@ async function handleAnalysis(message, user, settings) {
         inputUrl: input.inputUrl || input.imageUrl,
         userInput: buildUserInput(message, input),
         ...match,
+        media: buildActivityMedia(input, match),
         status: "rejected",
         rejectionReason: "low_similarity",
         botResponse: {
@@ -220,7 +242,7 @@ async function handleAnalysis(message, user, settings) {
       return;
     }
 
-    await sendResult(chatId, match, settings);
+    const sentMedia = await sendResult(chatId, match, settings);
     resultSent = true;
 
     await recordActivity({
@@ -231,6 +253,7 @@ async function handleAnalysis(message, user, settings) {
       inputUrl: input.inputUrl || input.imageUrl,
       userInput: buildUserInput(message, input),
       ...match,
+      media: buildActivityMedia(input, match, sentMedia),
       status: "success",
       rejectionReason: null,
       botResponse: buildSuccessResponse(match)
@@ -255,6 +278,9 @@ async function handleAnalysis(message, user, settings) {
       ...input,
       inputUrl: input.inputUrl || input.imageUrl,
       userInput: buildUserInput(message, input),
+      imageUrl: null,
+      videoUrl: null,
+      media: buildActivityMedia(input),
       status,
       rejectionReason,
       botResponse: {
