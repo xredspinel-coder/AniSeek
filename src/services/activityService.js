@@ -2,10 +2,17 @@ import { db, FieldValue } from "../firebaseAdmin.js";
 import { todayKey } from "./limitService.js";
 
 export async function recordActivity(activity) {
+  const normalizedStatus = activity.status === "error" ? "failed" : activity.status;
   const payload = {
     userId: String(activity.userId),
+    user: activity.user || null,
     source: activity.source,
     inputUrl: activity.inputUrl || null,
+    inputType: activity.inputType || activity.source || null,
+    inputFileId: activity.inputFileId || null,
+    inputThumbnail: activity.inputThumbnail || null,
+    inputPreview: activity.inputPreview || activity.imageUrl || null,
+    userInput: activity.userInput || null,
     animeTitle: activity.animeTitle || null,
     anilistId: activity.anilistId || null,
     anilistUrl: activity.anilistUrl || null,
@@ -16,7 +23,9 @@ export async function recordActivity(activity) {
     similarity: activity.similarity ?? null,
     videoUrl: activity.videoUrl || null,
     imageUrl: activity.imageUrl || null,
-    status: activity.status || "success",
+    status: normalizedStatus || "success",
+    rejectionReason: activity.rejectionReason || null,
+    botResponse: activity.botResponse || null,
     error: activity.error || null,
     createdAt: FieldValue.serverTimestamp()
   };
@@ -60,10 +69,15 @@ async function updateDailyAnalytics(activity) {
 
   if (activity.status === "success") {
     patch.success = FieldValue.increment(1);
-  } else if (activity.status === "low_similarity") {
-    patch.lowSimilarity = FieldValue.increment(1);
+  } else if (activity.status === "rejected" || activity.status === "low_similarity") {
+    patch.rejected = FieldValue.increment(1);
   } else {
-    patch.errors = FieldValue.increment(1);
+    patch.failed = FieldValue.increment(1);
+  }
+
+  if (Number.isFinite(activity.similarity)) {
+    patch.similarityTotal = FieldValue.increment(activity.similarity);
+    patch.similarityCount = FieldValue.increment(1);
   }
 
   await ref.set(patch, { merge: true });

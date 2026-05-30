@@ -4,7 +4,7 @@ import { getOrCreateUser } from "./services/userService.js";
 import { checkAnalysisAccess, incrementDailyUsage } from "./services/limitService.js";
 import { searchAnimeScene } from "./services/animeService.js";
 import { recordActivity, recordError } from "./services/activityService.js";
-import { resolveImageInput } from "./services/linkExtractorService.js";
+import { InputResolutionError, extractUrls, resolveImageInput } from "./services/linkExtractorService.js";
 
 const token = process.env.BOT_TOKEN;
 
@@ -33,7 +33,45 @@ function helpMessage() {
   ].join("\n");
 }
 
-function buildResultMessage(match, activityId) {
+function buildUserSnapshot(user) {
+  return {
+    telegramId: user.telegramId,
+    username: user.username || null,
+    firstName: user.firstName || null,
+    lastName: user.lastName || null,
+    displayName: [user.firstName, user.lastName].filter(Boolean).join(" ") || user.username || user.telegramId
+  };
+}
+
+function buildUserInput(message, input = {}) {
+  const text = message.text || message.caption || null;
+  const [firstUrl] = extractUrls(message);
+
+  return {
+    messageId: message.message_id || null,
+    chatId: message.chat?.id ? String(message.chat.id) : null,
+    text,
+    url: input.inputUrl || firstUrl || null,
+    fileId: input.inputFileId || message.document?.file_id || null,
+    source: input.source || null,
+    type: input.inputType || null,
+    isForwarded: Boolean(message.forward_origin || message.forward_from || message.forward_sender_name || message.forward_date)
+  };
+}
+
+function buildSuccessResponse(match) {
+  return {
+    title: match.animeTitle,
+    similarity: match.similarity,
+    episode: match.episode ?? null,
+    time: match.formattedTime || null,
+    anilistUrl: match.anilistUrl || null,
+    imageUrl: match.imageUrl || null,
+    videoUrl: match.videoUrl || null
+  };
+}
+
+function buildResultMessage(match) {
   const lines = [
     `<b>${escapeHtml(match.animeTitle)}</b>`,
     `Similarity: <b>${escapeHtml(match.similarity)}%</b>`
@@ -51,12 +89,11 @@ function buildResultMessage(match, activityId) {
     lines.push(`AniList: <a href="${escapeHtml(match.anilistUrl)}">open page</a>`);
   }
 
-  lines.push(`Activity: <code>${escapeHtml(activityId)}</code>`);
   return lines.join("\n");
 }
 
-async function sendResult(chatId, match, activityId, settings) {
-  const caption = buildResultMessage(match, activityId);
+async function sendResult(chatId, match, settings) {
+  const caption = buildResultMessage(match);
 
   if (settings.enableVideoPreview && match.videoUrl) {
     try {
@@ -78,22 +115,67 @@ async function sendResult(chatId, match, activityId, settings) {
 
 async function handleAnalysis(message, user, settings) {
   const chatId = message.chat.id;
+  const userSnapshot = buildUserSnapshot(user);
   let input;
 
   try {
     input = await resolveImageInput(message, bot, settings);
   } catch (error) {
-    await recordError({
+    const status = error instanceof InputResolutionError ? error.status : "failed";
+    const rejectionReason = error instanceof InputResolutionError ? error.rejectionReason : "processing_error";
+    const botResponse = {
+      message: error.message
+    };
+
+    await recordActivity({
       userId: user.telegramId,
-      message: error.message,
-      stack: error.stack
+      user: userSnapshot,
+      source: error.source || "unknown",
+      inputUrl: error.inputUrl || buildUserInput(message).url,
+      inputType: error.source || "unknown",
+      userInput: buildUserInput(message, {
+        inputUrl: error.inputUrl,
+        source: error.source,
+        inputType: error.source
+      }),
+      status,
+      rejectionReason,
+      botResponse,
+      error: status === "failed" ? error.message : null
     });
+
+    if (status === "failed") {
+      await recordError({
+        userId: user.telegramId,
+        source: error.source || null,
+        inputUrl: error.inputUrl || null,
+        message: error.message,
+        stack: error.stack
+      }, {
+        countAnalytics: false
+      });
+    }
 
     await bot.sendMessage(chatId, error.message);
     return;
   }
 
   if (!input) {
+    const botResponse = {
+      message: "Send an anime screenshot, a forwarded image, a direct image URL, or a supported social link."
+    };
+
+    await recordActivity({
+      userId: user.telegramId,
+      user: userSnapshot,
+      source: "unknown",
+      inputType: "unknown",
+      userInput: buildUserInput(message),
+      status: "rejected",
+      rejectionReason: "invalid_media",
+      botResponse
+    });
+
     await bot.sendMessage(chatId, helpMessage(), {
       parse_mode: "HTML"
     });
@@ -108,53 +190,92 @@ async function handleAnalysis(message, user, settings) {
   }
 
   const progressMessage = await bot.sendMessage(chatId, "Searching the scene...");
+  let resultSent = false;
 
   try {
     const match = await searchAnimeScene(input.imageUrl);
     const threshold = Number(settings.similarityThreshold) || 0;
-    const status = match.similarity >= threshold ? "success" : "low_similarity";
 
-    const activity = await recordActivity({
-      userId: user.telegramId,
-      source: input.source,
-      inputUrl: input.inputUrl || input.imageUrl,
-      ...match,
-      status,
-      error: status === "low_similarity" ? `Similarity is below ${threshold}%` : null
-    });
+    if (match.similarity < threshold) {
+      const messageText = `No confident match. Best result was ${match.similarity}%, below the ${threshold}% threshold.`;
 
-    await incrementDailyUsage(user.telegramId);
+      await recordActivity({
+        userId: user.telegramId,
+        user: userSnapshot,
+        source: input.source,
+        ...input,
+        inputUrl: input.inputUrl || input.imageUrl,
+        userInput: buildUserInput(message, input),
+        ...match,
+        status: "rejected",
+        rejectionReason: "low_similarity",
+        botResponse: {
+          ...buildSuccessResponse(match),
+          message: messageText
+        },
+        error: `Similarity is below ${threshold}%`
+      });
 
-    if (status === "low_similarity") {
-      await bot.sendMessage(
-        chatId,
-        `No confident match. Best result was ${match.similarity}%, below the ${threshold}% threshold.`
-      );
+      await bot.sendMessage(chatId, messageText);
       return;
     }
 
-    await sendResult(chatId, match, activity.id, settings);
-  } catch (error) {
+    await sendResult(chatId, match, settings);
+    resultSent = true;
+
     await recordActivity({
       userId: user.telegramId,
+      user: userSnapshot,
       source: input.source,
+      ...input,
       inputUrl: input.inputUrl || input.imageUrl,
-      status: "error",
-      error: error.message
-    });
-
-    await recordError({
-      userId: user.telegramId,
-      source: input.source,
-      inputUrl: input.inputUrl || input.imageUrl,
-      message: error.message,
-      stack: error.stack
-    }, {
-      countAnalytics: false
+      userInput: buildUserInput(message, input),
+      ...match,
+      status: "success",
+      rejectionReason: null,
+      botResponse: buildSuccessResponse(match)
     });
 
     await incrementDailyUsage(user.telegramId);
-    await bot.sendMessage(chatId, `I could not analyze that image: ${error.message}`);
+  } catch (error) {
+    if (resultSent) {
+      console.error("Successful Telegram response was sent, but post-send logging failed.", error);
+      return;
+    }
+
+    const isNoMatch = /did not return a match|no result/i.test(error.message);
+    const status = isNoMatch ? "rejected" : "failed";
+    const rejectionReason = isNoMatch ? "no_match" : "api_error";
+    const messageText = `I could not analyze that image: ${error.message}`;
+
+    await recordActivity({
+      userId: user.telegramId,
+      user: userSnapshot,
+      source: input.source,
+      ...input,
+      inputUrl: input.inputUrl || input.imageUrl,
+      userInput: buildUserInput(message, input),
+      status,
+      rejectionReason,
+      botResponse: {
+        message: messageText
+      },
+      error: error.message
+    });
+
+    if (status === "failed") {
+      await recordError({
+        userId: user.telegramId,
+        source: input.source,
+        inputUrl: input.inputUrl || input.imageUrl,
+        message: error.message,
+        stack: error.stack
+      }, {
+        countAnalytics: false
+      });
+    }
+
+    await bot.sendMessage(chatId, messageText);
   } finally {
     bot.deleteMessage(chatId, progressMessage.message_id).catch(() => {});
   }

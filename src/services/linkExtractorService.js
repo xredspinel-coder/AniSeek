@@ -1,6 +1,17 @@
 const IMAGE_EXTENSION_PATTERN = /\.(avif|gif|jpe?g|png|webp)(\?.*)?$/i;
 const URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
 
+export class InputResolutionError extends Error {
+  constructor(message, { status = "rejected", rejectionReason = "invalid_media", source = null, inputUrl = null } = {}) {
+    super(message);
+    this.name = "InputResolutionError";
+    this.status = status;
+    this.rejectionReason = rejectionReason;
+    this.source = source;
+    this.inputUrl = inputUrl;
+  }
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -80,7 +91,11 @@ async function fetchHtml(url) {
   });
 
   if (!response.ok) {
-    throw new Error(`Could not fetch page metadata (${response.status}).`);
+    throw new InputResolutionError(`Could not fetch page metadata (${response.status}).`, {
+      status: "failed",
+      rejectionReason: "api_error",
+      inputUrl: url
+    });
   }
 
   return response.text();
@@ -109,23 +124,39 @@ async function resolveSocialImage(url) {
   const imageUrl = extractMetaImage(html);
 
   if (!imageUrl) {
-    throw new Error("No image preview was found on that page.");
+    throw new InputResolutionError("No image preview was found on that page.", {
+      status: "rejected",
+      rejectionReason: "invalid_media",
+      inputUrl: url
+    });
   }
 
   return new URL(imageUrl, url).toString();
 }
 
-function ensureSocialEnabled(source, settings) {
+function ensureSocialEnabled(source, settings, url) {
   if (source === "reddit" && !settings.enableReddit) {
-    throw new Error("Reddit links are disabled by the current settings.");
+    throw new InputResolutionError("Reddit links are disabled by the current settings.", {
+      rejectionReason: "unsupported_source",
+      source,
+      inputUrl: url
+    });
   }
 
   if (source === "twitter" && !settings.enableTwitter) {
-    throw new Error("Twitter/X links are disabled by the current settings.");
+    throw new InputResolutionError("Twitter/X links are disabled by the current settings.", {
+      rejectionReason: "unsupported_source",
+      source,
+      inputUrl: url
+    });
   }
 
   if (source === "facebook" && !settings.enableFacebook) {
-    throw new Error("Facebook links are disabled by the current settings.");
+    throw new InputResolutionError("Facebook links are disabled by the current settings.", {
+      rejectionReason: "unsupported_source",
+      source,
+      inputUrl: url
+    });
   }
 }
 
@@ -137,18 +168,33 @@ export async function resolveImageInput(message, bot, settings) {
   const photo = getLargestPhoto(message);
 
   if (photo) {
+    const imageUrl = await bot.getFileLink(photo.file_id);
+
     return {
       source: isForwarded(message) ? "forwarded_image" : "telegram_image",
+      inputType: isForwarded(message) ? "telegram_forward" : "image",
       inputUrl: null,
-      imageUrl: await bot.getFileLink(photo.file_id)
+      inputFileId: photo.file_id,
+      inputThumbnail: imageUrl,
+      inputPreview: imageUrl,
+      imageUrl
     };
   }
 
   if (message.document?.mime_type?.startsWith("image/") && message.document.file_id) {
+    const imageUrl = await bot.getFileLink(message.document.file_id);
+    const thumbnailUrl = message.document.thumbnail?.file_id
+      ? await bot.getFileLink(message.document.thumbnail.file_id)
+      : imageUrl;
+
     return {
       source: isForwarded(message) ? "forwarded_image" : "telegram_image",
+      inputType: isForwarded(message) ? "telegram_forward" : "image",
       inputUrl: null,
-      imageUrl: await bot.getFileLink(message.document.file_id)
+      inputFileId: message.document.file_id,
+      inputThumbnail: thumbnailUrl,
+      inputPreview: imageUrl,
+      imageUrl
     };
   }
 
@@ -161,29 +207,58 @@ export async function resolveImageInput(message, bot, settings) {
   if (isDirectImageUrl(url)) {
     return {
       source: "direct_url",
+      inputType: "url",
       inputUrl: url,
+      inputFileId: null,
+      inputThumbnail: url,
+      inputPreview: url,
       imageUrl: url
     };
   }
 
   const source = classifyHost(url);
-  ensureSocialEnabled(source, settings);
+  ensureSocialEnabled(source, settings, url);
 
   if (source === "direct_url" && await isImageByContentType(url)) {
     return {
       source: "direct_url",
+      inputType: "url",
       inputUrl: url,
+      inputFileId: null,
+      inputThumbnail: url,
+      inputPreview: url,
       imageUrl: url
     };
   }
 
   if (source === "direct_url") {
-    throw new Error("Please send a direct image URL or a URL that returns image content.");
+    throw new InputResolutionError("Please send a direct image URL or a URL that returns image content.", {
+      rejectionReason: "invalid_media",
+      source,
+      inputUrl: url
+    });
+  }
+
+  let imageUrl;
+
+  try {
+    imageUrl = await resolveSocialImage(url);
+  } catch (error) {
+    if (error instanceof InputResolutionError) {
+      error.source = error.source || source;
+      error.inputUrl = error.inputUrl || url;
+    }
+
+    throw error;
   }
 
   return {
     source,
+    inputType: source,
     inputUrl: url,
-    imageUrl: await resolveSocialImage(url)
+    inputFileId: null,
+    inputThumbnail: imageUrl,
+    inputPreview: imageUrl,
+    imageUrl
   };
 }
