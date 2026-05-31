@@ -3,7 +3,7 @@ import { getSettings } from "./services/settingsService.js";
 import { getOrCreateUser } from "./services/userService.js";
 import { checkAnalysisAccess, incrementDailyUsage } from "./services/limitService.js";
 import { searchAnimeScene } from "./services/animeService.js";
-import { recordActivity, recordError } from "./services/activityService.js";
+import { isTechnicalFailureType, recordActivity, recordError } from "./services/activityService.js";
 import { InputResolutionError, extractUrls, resolveImageInput } from "./services/linkExtractorService.js";
 
 const token = process.env.BOT_TOKEN;
@@ -52,7 +52,7 @@ function buildUserInput(message, input = {}) {
     chatId: message.chat?.id ? String(message.chat.id) : null,
     text,
     url: input.inputUrl || firstUrl || null,
-    fileId: input.inputFileId || message.document?.file_id || null,
+    fileId: input.inputTelegramFileId || input.inputFileId || message.document?.file_id || null,
     source: input.source || null,
     type: input.inputType || null,
     isForwarded: Boolean(message.forward_origin || message.forward_from || message.forward_sender_name || message.forward_date)
@@ -72,13 +72,19 @@ function buildSuccessResponse(match) {
 }
 
 function buildActivityMedia(input = {}, result = {}, sentMedia = {}) {
+  const inputTelegramFileId = input.inputTelegramFileId || input.inputFileId || null;
+
   return {
-    inputImageUrl: input.inputImageUrl || input.inputPreview || input.inputThumbnail || null,
+    inputTelegramFileId,
+    sentPhotoFileId: sentMedia.sentPhotoFileId || null,
+    sentVideoFileId: sentMedia.sentVideoFileId || null,
+    sentAnimationFileId: sentMedia.sentAnimationFileId || null,
+    inputImageUrl: inputTelegramFileId ? null : input.inputImageUrl || input.inputPreview || input.inputThumbnail || null,
     inputTelegramFileUrl: input.inputTelegramFileUrl || null,
     resultImageUrl: result.imageUrl || result.resultImageUrl || null,
     resultVideoUrl: result.videoUrl || result.resultVideoUrl || null,
     botVideoUrl: sentMedia.botVideoUrl || null,
-    botImageUrl: sentMedia.botImageUrl || result.imageUrl || null
+    botImageUrl: sentMedia.botImageUrl || null
   };
 }
 
@@ -108,13 +114,16 @@ async function sendResult(chatId, match, settings) {
 
   if (settings.enableVideoPreview && match.videoUrl) {
     try {
-      await bot.sendVideo(chatId, match.videoUrl, {
+      const sentMessage = await bot.sendVideo(chatId, match.videoUrl, {
         caption,
         parse_mode: "HTML"
       });
       return {
-        botVideoUrl: match.videoUrl,
-        botImageUrl: match.imageUrl || null
+        botVideoUrl: null,
+        botImageUrl: null,
+        sentPhotoFileId: sentMessage.photo?.at(-1)?.file_id || null,
+        sentVideoFileId: sentMessage.video?.file_id || null,
+        sentAnimationFileId: sentMessage.animation?.file_id || null
       };
     } catch (error) {
       console.warn("Telegram video preview failed, falling back to message.", error.message);
@@ -128,7 +137,10 @@ async function sendResult(chatId, match, settings) {
 
   return {
     botVideoUrl: null,
-    botImageUrl: match.imageUrl || null
+    botImageUrl: null,
+    sentPhotoFileId: null,
+    sentVideoFileId: null,
+    sentAnimationFileId: null
   };
 }
 
@@ -140,13 +152,13 @@ async function handleAnalysis(message, user, settings) {
   try {
     input = await resolveImageInput(message, bot, settings);
   } catch (error) {
-    const status = error instanceof InputResolutionError ? error.status : "failed";
     const rejectionReason = error instanceof InputResolutionError ? error.rejectionReason : "processing_error";
+    const failureType = isTechnicalFailureType(rejectionReason) ? rejectionReason : "processing_error";
     const botResponse = {
       message: error.message
     };
 
-    await recordActivity({
+    await recordError({
       userId: user.telegramId,
       user: userSnapshot,
       source: error.source || "unknown",
@@ -158,23 +170,13 @@ async function handleAnalysis(message, user, settings) {
         inputType: error.source
       }),
       media: buildActivityMedia(),
-      status,
+      status: "failed",
+      failureType,
       rejectionReason,
       botResponse,
-      error: status === "failed" ? error.message : null
+      message: error.message,
+      stack: error.stack
     });
-
-    if (status === "failed") {
-      await recordError({
-        userId: user.telegramId,
-        source: error.source || null,
-        inputUrl: error.inputUrl || null,
-        message: error.message,
-        stack: error.stack
-      }, {
-        countAnalytics: false
-      });
-    }
 
     await bot.sendMessage(chatId, error.message);
     return;
@@ -185,16 +187,18 @@ async function handleAnalysis(message, user, settings) {
       message: "Send an anime screenshot, a forwarded image, a direct image URL, or a supported social link."
     };
 
-    await recordActivity({
+    await recordError({
       userId: user.telegramId,
       user: userSnapshot,
       source: "unknown",
       inputType: "unknown",
       userInput: buildUserInput(message),
       media: buildActivityMedia(),
-      status: "rejected",
+      status: "failed",
+      failureType: "invalid_media",
       rejectionReason: "invalid_media",
-      botResponse
+      botResponse,
+      message: botResponse.message
     });
 
     await bot.sendMessage(chatId, helpMessage(), {
@@ -229,7 +233,7 @@ async function handleAnalysis(message, user, settings) {
         userInput: buildUserInput(message, input),
         ...match,
         media: buildActivityMedia(input, match),
-        status: "rejected",
+        status: "low_similarity",
         rejectionReason: "low_similarity",
         botResponse: {
           ...buildSuccessResponse(match),
@@ -268,36 +272,44 @@ async function handleAnalysis(message, user, settings) {
 
     const isNoMatch = /did not return a match|no result/i.test(error.message);
     const status = isNoMatch ? "rejected" : "failed";
-    const rejectionReason = isNoMatch ? "no_match" : "api_error";
+    const rejectionReason = isNoMatch ? "no_match" : "trace_api_error";
     const messageText = `I could not analyze that image: ${error.message}`;
 
-    await recordActivity({
-      userId: user.telegramId,
-      user: userSnapshot,
-      source: input.source,
-      ...input,
-      inputUrl: input.inputUrl || input.imageUrl,
-      userInput: buildUserInput(message, input),
-      imageUrl: null,
-      videoUrl: null,
-      media: buildActivityMedia(input),
-      status,
-      rejectionReason,
-      botResponse: {
-        message: messageText
-      },
-      error: error.message
-    });
-
-    if (status === "failed") {
+    if (isNoMatch) {
+      await recordActivity({
+        userId: user.telegramId,
+        user: userSnapshot,
+        source: input.source,
+        ...input,
+        inputUrl: input.inputUrl || input.imageUrl,
+        userInput: buildUserInput(message, input),
+        imageUrl: null,
+        videoUrl: null,
+        media: buildActivityMedia(input),
+        status,
+        rejectionReason,
+        botResponse: {
+          message: messageText
+        },
+        error: error.message
+      });
+    } else {
       await recordError({
         userId: user.telegramId,
+        user: userSnapshot,
         source: input.source,
-        inputUrl: input.inputUrl || input.imageUrl,
+        ...input,
+        inputUrl: input.inputUrl || null,
+        userInput: buildUserInput(message, input),
+        media: buildActivityMedia(input),
+        status,
+        failureType: "trace_api_error",
+        rejectionReason,
+        botResponse: {
+          message: messageText
+        },
         message: error.message,
         stack: error.stack
-      }, {
-        countAnalytics: false
       });
     }
 
@@ -333,6 +345,7 @@ bot.on("message", async (message) => {
 
     await recordError({
       userId: message.from?.id,
+      failureType: "processing_error",
       message: error.message,
       stack: error.stack
     }).catch(() => {});

@@ -1,6 +1,19 @@
 import { db, FieldValue } from "../firebaseAdmin.js";
 import { todayKey } from "./limitService.js";
 
+const TECHNICAL_FAILURE_TYPES = new Set([
+  "invalid_media",
+  "unsupported_source",
+  "invalid_url",
+  "processing_error",
+  "telegram_download_error",
+  "trace_api_error"
+]);
+
+export function isTechnicalFailureType(type) {
+  return TECHNICAL_FAILURE_TYPES.has(type);
+}
+
 function hasOwn(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
 }
@@ -31,6 +44,10 @@ function mediaValue(activity, key, ...fallbacks) {
 
 function normalizeMedia(activity) {
   return {
+    inputTelegramFileId: mediaValue(activity, "inputTelegramFileId", activity.inputTelegramFileId, activity.inputFileId),
+    sentPhotoFileId: mediaValue(activity, "sentPhotoFileId", activity.sentPhotoFileId),
+    sentVideoFileId: mediaValue(activity, "sentVideoFileId", activity.sentVideoFileId),
+    sentAnimationFileId: mediaValue(activity, "sentAnimationFileId", activity.sentAnimationFileId),
     inputImageUrl: mediaValue(
       activity,
       "inputImageUrl",
@@ -48,6 +65,17 @@ function normalizeMedia(activity) {
 }
 
 export async function recordActivity(activity) {
+  const failureType = activity.failureType || activity.rejectionReason || null;
+
+  if (isTechnicalFailureType(failureType)) {
+    return recordError({
+      ...activity,
+      status: "failed",
+      failureType,
+      message: activity.error || activity.botResponse?.message || failureType
+    });
+  }
+
   const normalizedStatus = activity.status === "error" ? "failed" : activity.status;
   const media = normalizeMedia(activity);
   const payload = {
@@ -57,6 +85,7 @@ export async function recordActivity(activity) {
     inputUrl: activity.inputUrl || null,
     inputType: activity.inputType || activity.source || null,
     inputFileId: activity.inputFileId || null,
+    inputTelegramFileId: activity.inputTelegramFileId || media.inputTelegramFileId || null,
     inputTelegramFileUrl: activity.inputTelegramFileUrl || media.inputTelegramFileUrl,
     inputImageUrl: activity.inputImageUrl || media.inputImageUrl,
     inputThumbnail: activity.inputThumbnail || null,
@@ -89,23 +118,39 @@ export async function recordActivity(activity) {
 }
 
 export async function recordError(error, { countAnalytics = true } = {}) {
+  const media = normalizeMedia(error);
   const payload = {
     userId: error.userId ? String(error.userId) : null,
+    user: error.user || null,
     source: error.source || null,
     inputUrl: error.inputUrl || null,
+    inputType: error.inputType || error.source || null,
+    inputFileId: error.inputFileId || null,
+    inputTelegramFileId: error.inputTelegramFileId || media.inputTelegramFileId || null,
+    userInput: error.userInput || null,
     message: error.message || "Unknown error",
+    failureType: error.failureType || error.rejectionReason || error.errorType || null,
+    status: error.status || "failed",
+    rejectionReason: error.rejectionReason || null,
+    media,
+    botResponse: error.botResponse || null,
     stack: error.stack || null,
     createdAt: FieldValue.serverTimestamp()
   };
 
-  await db.collection("errors").add(payload);
+  const errorRef = await db.collection("errors").add(payload);
 
   if (countAnalytics) {
     await updateDailyAnalytics({
       userId: payload.userId,
-      status: "error"
+      status: "failed"
     });
   }
+
+  return {
+    id: errorRef.id,
+    ...payload
+  };
 }
 
 async function updateDailyAnalytics(activity) {

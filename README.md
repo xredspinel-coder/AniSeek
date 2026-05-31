@@ -18,12 +18,13 @@ Copy `.env.example` to `.env` and fill:
 ```env
 BOT_TOKEN=
 BASE_URL=
+DASHBOARD_ORIGIN=
 FIREBASE_PROJECT_ID=
 FIREBASE_CLIENT_EMAIL=
 FIREBASE_PRIVATE_KEY=
 ```
 
-`FIREBASE_PRIVATE_KEY` may contain escaped newlines (`\n`). Runtime settings such as `dailyLimit` and `maintenanceMode` are not read from `.env`; they are read from `settings/global` in Firestore.
+`DASHBOARD_ORIGIN` is optional and can be a comma-separated list of dashboard origins allowed to call `GET /telegram/file-url`. If it is omitted, that resolver endpoint returns `Access-Control-Allow-Origin: *`. `FIREBASE_PRIVATE_KEY` may contain escaped newlines (`\n`). Runtime settings such as `dailyLimit` and `maintenanceMode` are not read from `.env`; they are read from `settings/global` in Firestore.
 
 ## Local Development
 
@@ -33,6 +34,8 @@ npm run dev
 ```
 
 The server listens on `http://localhost:8080` and receives Telegram updates at `POST /telegram/webhook`.
+
+The dashboard media resolver is available at `GET /telegram/file-url?fileId=TELEGRAM_FILE_ID`. It asks Telegram for the current file path and returns a Telegram file URL without storing media in Firebase Storage.
 
 `npm run dev` is a long-running local server command. Stop it with `Ctrl+C` when finished.
 
@@ -69,7 +72,9 @@ For every user message, the bot reads settings through the TTL cache, reads or c
 - `unlimitedUntil`
 - `isAdmin`
 
-If a request reaches trace.moe/AniList analysis, the bot writes `activities/{activityId}`. Successful matches use `status: "success"`, low-confidence matches use `status: "low_similarity"`, and failed analysis attempts use `status: "error"`. Detailed failures are also written to `errors/{errorId}`.
+If a request reaches trace.moe/AniList analysis, the bot writes normal user-facing outcomes to `activities/{activityId}`. Successful matches use `status: "success"`, low-confidence matches use `status: "low_similarity"`, and trace responses with no match use a rejected activity with `rejectionReason: "no_match"`.
+
+Technical failures such as `invalid_media`, `unsupported_source`, `invalid_url`, `processing_error`, `telegram_download_error`, and `trace_api_error` are written to `errors/{errorId}` instead of normal activity documents.
 
 Attempts that reach the analysis step increment `dailyUsed`.
 

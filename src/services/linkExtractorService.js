@@ -43,13 +43,24 @@ function getLargestPhoto(message) {
   return photos[photos.length - 1] || null;
 }
 
-async function getTelegramFileUrl(bot, fileId) {
-  const file = await bot.getFile(fileId);
+async function getTelegramFileUrl(bot, fileId, source = "telegram_image") {
+  let file;
+
+  try {
+    file = await bot.getFile(fileId);
+  } catch (error) {
+    throw new InputResolutionError(`Could not download Telegram media: ${error.message}`, {
+      status: "failed",
+      rejectionReason: "telegram_download_error",
+      source
+    });
+  }
 
   if (!file?.file_path) {
     throw new InputResolutionError("Could not resolve Telegram file URL.", {
       status: "failed",
-      rejectionReason: "api_error"
+      rejectionReason: "telegram_download_error",
+      source
     });
   }
 
@@ -106,7 +117,7 @@ async function fetchHtml(url) {
   if (!response.ok) {
     throw new InputResolutionError(`Could not fetch page metadata (${response.status}).`, {
       status: "failed",
-      rejectionReason: "api_error",
+      rejectionReason: "processing_error",
       inputUrl: url
     });
   }
@@ -188,35 +199,28 @@ export async function resolveImageInput(message, bot, settings) {
       inputType: isForwarded(message) ? "telegram_forward" : "image",
       inputUrl: null,
       inputFileId: photo.file_id,
-      inputTelegramFileUrl: imageUrl,
-      inputImageUrl: imageUrl,
-      inputThumbnail: imageUrl,
-      inputPreview: imageUrl,
+      inputTelegramFileId: photo.file_id,
+      inputTelegramFileUrl: null,
+      inputImageUrl: null,
+      inputThumbnail: null,
+      inputPreview: null,
       imageUrl
     };
   }
 
   if (message.document?.mime_type?.startsWith("image/") && message.document.file_id) {
     const imageUrl = await getTelegramFileUrl(bot, message.document.file_id);
-    let thumbnailUrl = imageUrl;
-
-    if (message.document.thumbnail?.file_id) {
-      try {
-        thumbnailUrl = await getTelegramFileUrl(bot, message.document.thumbnail.file_id);
-      } catch {
-        thumbnailUrl = imageUrl;
-      }
-    }
 
     return {
       source: isForwarded(message) ? "forwarded_image" : "telegram_image",
       inputType: isForwarded(message) ? "telegram_forward" : "image",
       inputUrl: null,
       inputFileId: message.document.file_id,
-      inputTelegramFileUrl: imageUrl,
-      inputImageUrl: imageUrl,
-      inputThumbnail: thumbnailUrl,
-      inputPreview: imageUrl,
+      inputTelegramFileId: message.document.file_id,
+      inputTelegramFileUrl: null,
+      inputImageUrl: null,
+      inputThumbnail: null,
+      inputPreview: null,
       imageUrl
     };
   }
@@ -241,7 +245,17 @@ export async function resolveImageInput(message, bot, settings) {
     };
   }
 
-  const source = classifyHost(url);
+  let source;
+
+  try {
+    source = classifyHost(url);
+  } catch {
+    throw new InputResolutionError("That URL is not valid.", {
+      rejectionReason: "invalid_url",
+      source: "url",
+      inputUrl: url
+    });
+  }
   ensureSocialEnabled(source, settings, url);
 
   if (source === "direct_url" && await isImageByContentType(url)) {
