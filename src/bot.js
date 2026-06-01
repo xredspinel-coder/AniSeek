@@ -109,6 +109,14 @@ function buildResultMessage(match) {
   return lines.join("\n");
 }
 
+function sentTelegramMediaIds(sentMessage = {}) {
+  return {
+    sentPhotoFileId: sentMessage.photo?.at(-1)?.file_id || null,
+    sentVideoFileId: sentMessage.video?.file_id || null,
+    sentAnimationFileId: sentMessage.animation?.file_id || null
+  };
+}
+
 async function sendResult(chatId, match, settings) {
   const caption = buildResultMessage(match);
 
@@ -121,9 +129,7 @@ async function sendResult(chatId, match, settings) {
       return {
         botVideoUrl: null,
         botImageUrl: null,
-        sentPhotoFileId: sentMessage.photo?.at(-1)?.file_id || null,
-        sentVideoFileId: sentMessage.video?.file_id || null,
-        sentAnimationFileId: sentMessage.animation?.file_id || null
+        ...sentTelegramMediaIds(sentMessage)
       };
     } catch (error) {
       console.warn("Telegram video preview failed, falling back to message.", error.message);
