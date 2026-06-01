@@ -8,10 +8,14 @@ const token = process.env.BOT_TOKEN;
 
 app.use(express.json({ limit: "2mb" }));
 
+function normalizeOrigin(origin) {
+  return String(origin || "").trim().replace(/\/+$/, "");
+}
+
 function dashboardOrigins() {
   return String(process.env.DASHBOARD_ORIGIN || "")
     .split(",")
-    .map((origin) => origin.trim())
+    .map(normalizeOrigin)
     .filter(Boolean);
 }
 
@@ -19,7 +23,7 @@ function setResolverCors(req, res) {
   res.set("Cache-Control", "no-store");
   res.set("Vary", "Origin");
 
-  const requestOrigin = req.headers.origin;
+  const requestOrigin = normalizeOrigin(req.headers.origin);
   if (!requestOrigin || !dashboardOrigins().includes(requestOrigin)) {
     return false;
   }
