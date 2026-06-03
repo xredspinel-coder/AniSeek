@@ -52,6 +52,8 @@ export async function getOrCreateUser(message) {
         dailyUsedDate: null,
         dailyLimitOverride: null,
         unlimitedUntil: null,
+        trustedUser: false,
+        trustedUntil: null,
         isBlocked: false,
         isAdmin: false
       };
@@ -71,6 +73,8 @@ export async function getOrCreateUser(message) {
       dailyUsedDate: null,
       dailyLimitOverride: null,
       unlimitedUntil: null,
+      trustedUser: false,
+      trustedUntil: null,
       isBlocked: false,
       isAdmin: false,
       ...snapshot.data(),

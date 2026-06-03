@@ -5,7 +5,11 @@ export const defaultSettings = {
   enableReddit: true,
   enableFacebook: false,
   enableVideoPreview: true,
-  maintenanceMode: false
+  maintenanceMode: false,
+  trendingWindowHours: 24,
+  allowTrustedBypass: true,
+  enableRandomAnime: true,
+  enableTopAnime: true
 };
 
 export const settingsCacheTTL = 60 * 1000;

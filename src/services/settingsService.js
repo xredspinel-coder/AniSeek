@@ -34,7 +34,14 @@ function normalizeSettings(raw = {}) {
     enableReddit: asBoolean(raw.enableReddit, defaultSettings.enableReddit),
     enableFacebook: asBoolean(raw.enableFacebook, defaultSettings.enableFacebook),
     enableVideoPreview: asBoolean(raw.enableVideoPreview, defaultSettings.enableVideoPreview),
-    maintenanceMode: asBoolean(raw.maintenanceMode, defaultSettings.maintenanceMode)
+    maintenanceMode: asBoolean(raw.maintenanceMode, defaultSettings.maintenanceMode),
+    trendingWindowHours: Math.floor(asNumber(raw.trendingWindowHours, defaultSettings.trendingWindowHours, {
+      min: 1,
+      max: 168
+    })),
+    allowTrustedBypass: asBoolean(raw.allowTrustedBypass, defaultSettings.allowTrustedBypass),
+    enableRandomAnime: asBoolean(raw.enableRandomAnime, defaultSettings.enableRandomAnime),
+    enableTopAnime: asBoolean(raw.enableTopAnime, defaultSettings.enableTopAnime)
   };
 }
 
