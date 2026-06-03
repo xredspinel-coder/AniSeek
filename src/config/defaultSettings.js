@@ -4,10 +4,12 @@ export const defaultSettings = {
   enableTwitter: true,
   enableReddit: true,
   enableFacebook: false,
-  enableVideoPreview: true,
+  enableGenericLinks: true,
   maintenanceMode: false,
-  trendingWindowHours: 24,
   allowTrustedBypass: true,
+  enableTrendingSearches: true,
+  enableMyStatistics: true,
+  enableMyUsage: true,
   enableRandomAnime: true,
   enableTopAnime: true
 };

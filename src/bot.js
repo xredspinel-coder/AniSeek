@@ -13,7 +13,6 @@ import {
   getTrendingSearches,
   getUsageSummary,
   getUserStatsSummary,
-  isTrustedUser,
   recordBotEvent,
   setWrongMatchReason
 } from "./services/featureService.js";
@@ -29,6 +28,50 @@ export const bot = new TelegramBot(token, {
   polling: false
 });
 
+const TRENDING_WINDOW_HOURS = 24;
+const FEATURE_ITEMS = [
+  {
+    key: "usage",
+    setting: "enableMyUsage",
+    label: "📊 My Usage",
+    callbackData: "usage",
+    command: "/usage",
+    disabledMessage: "My Usage is disabled right now."
+  },
+  {
+    key: "stats",
+    setting: "enableMyStatistics",
+    label: "📈 My Statistics",
+    callbackData: "stats",
+    command: "/stats",
+    disabledMessage: "My Statistics is disabled right now."
+  },
+  {
+    key: "trending",
+    setting: "enableTrendingSearches",
+    label: "🔥 Trending Searches",
+    callbackData: "trend",
+    command: "/trending",
+    disabledMessage: "Trending Searches is disabled right now."
+  },
+  {
+    key: "random",
+    setting: "enableRandomAnime",
+    label: "🎲 Random Anime",
+    callbackData: "random",
+    command: "/random",
+    disabledMessage: "Random Anime is disabled right now."
+  },
+  {
+    key: "top",
+    setting: "enableTopAnime",
+    label: "🏆 Top Anime",
+    callbackData: "top",
+    command: "/top",
+    disabledMessage: "Top Anime is disabled right now."
+  }
+];
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -37,15 +80,60 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
-function helpMessage() {
-  return [
+function isFeatureEnabled(settings = {}, key) {
+  const feature = FEATURE_ITEMS.find((item) => item.key === key || item.callbackData === key || item.command === key);
+
+  if (!feature) {
+    return false;
+  }
+
+  return settings[feature.setting] !== false;
+}
+
+function enabledFeatureItems(settings = {}) {
+  return FEATURE_ITEMS.filter((item) => isFeatureEnabled(settings, item.key));
+}
+
+function featureByCommand(command) {
+  return FEATURE_ITEMS.find((item) => item.command === command) || null;
+}
+
+function featureByCallbackData(data) {
+  return FEATURE_ITEMS.find((item) => item.callbackData === data) || null;
+}
+
+function helpMessage(settings = {}) {
+  const commands = enabledFeatureItems(settings).map((item) => item.command);
+  const supportedLinks = ["direct images"];
+
+  if (settings.enableReddit !== false) {
+    supportedLinks.push("Reddit");
+  }
+
+  if (settings.enableTwitter !== false) {
+    supportedLinks.push("Twitter/X best effort");
+  }
+
+  if (settings.enableFacebook) {
+    supportedLinks.push("Facebook best effort");
+  }
+
+  if (settings.enableGenericLinks !== false) {
+    supportedLinks.push("generic website previews");
+  }
+
+  const lines = [
     "<b>AniSeek</b>",
     "Send an anime screenshot, a forwarded image, a direct image URL, or a supported social link.",
     "",
-    "Supported links: direct images, Reddit, Twitter/X best effort, Facebook best effort.",
-    "",
-    "Commands: /usage, /stats, /trending, /random, /top"
-  ].join("\n");
+    `Supported links: ${supportedLinks.join(", ")}.`
+  ];
+
+  if (commands.length) {
+    lines.push("", `Commands: ${commands.join(", ")}`);
+  }
+
+  return lines.join("\n");
 }
 
 function commandName(text = "") {
@@ -53,30 +141,29 @@ function commandName(text = "") {
   return command ? command.split("@")[0].toLowerCase() : "";
 }
 
-function resultActions(activityId) {
+function resultActions(activityId, settings = {}) {
   if (!activityId) {
     return undefined;
   }
 
+  const row = [
+    { text: "⚠️ Wrong Match", callback_data: `wrong:${activityId}` }
+  ];
+
+  if (enabledFeatureItems(settings).length) {
+    row.push({ text: "📋 More", callback_data: `more:${activityId}` });
+  }
+
   return {
-    inline_keyboard: [
-      [
-        { text: "⚠️ Wrong Match", callback_data: `wrong:${activityId}` },
-        { text: "📋 More", callback_data: `more:${activityId}` }
-      ]
-    ]
+    inline_keyboard: [row]
   };
 }
 
-function moreMenuKeyboard() {
+function moreMenuKeyboard(settings = {}) {
   return {
-    inline_keyboard: [
-      [{ text: "📊 My Usage", callback_data: "usage" }],
-      [{ text: "📈 My Statistics", callback_data: "stats" }],
-      [{ text: "🔥 Trending Searches", callback_data: "trend" }],
-      [{ text: "🎲 Random Anime", callback_data: "random" }],
-      [{ text: "🏆 Top Anime", callback_data: "top" }]
-    ]
+    inline_keyboard: enabledFeatureItems(settings).map((item) => [
+      { text: item.label, callback_data: item.callbackData }
+    ])
   };
 }
 
@@ -173,7 +260,11 @@ function buildUserInput(message, input = {}) {
     url: input.inputUrl || firstUrl || null,
     fileId: input.inputTelegramFileId || input.inputFileId || message.document?.file_id || null,
     source: input.source || null,
+    sourceType: input.sourceType || null,
     type: input.inputType || null,
+    extractedImageUrl: input.extractedImageUrl || null,
+    inputSourceDomain: input.inputSourceDomain || null,
+    previewExtractionStatus: input.previewExtractionStatus || null,
     isForwarded: Boolean(message.forward_origin || message.forward_from || message.forward_sender_name || message.forward_date)
   };
 }
@@ -199,12 +290,41 @@ function buildActivityMedia(input = {}, result = {}, sentMedia = {}) {
     sentVideoFileId: sentMedia.sentVideoFileId || null,
     sentAnimationFileId: sentMedia.sentAnimationFileId || null,
     inputImageUrl: inputTelegramFileId ? null : input.inputImageUrl || input.inputPreview || input.inputThumbnail || null,
+    extractedImageUrl: input.extractedImageUrl || null,
     inputTelegramFileUrl: input.inputTelegramFileUrl || null,
     resultImageUrl: result.imageUrl || result.resultImageUrl || null,
     resultVideoUrl: result.videoUrl || result.resultVideoUrl || null,
     botVideoUrl: sentMedia.botVideoUrl || null,
     botImageUrl: sentMedia.botImageUrl || null
   };
+}
+
+function previewExtractionSnapshot(input = {}) {
+  return {
+    sourceType: input.sourceType || null,
+    extractedImageUrl: input.extractedImageUrl || null,
+    inputSourceDomain: input.inputSourceDomain || null,
+    previewExtractionMethod: input.previewExtractionMethod || null,
+    previewExtractionStatus: input.previewExtractionStatus || null,
+    previewExtractionError: input.previewExtractionError || null,
+    previewExtractionCandidateCount: Number.isFinite(input.previewExtractionCandidateCount)
+      ? input.previewExtractionCandidateCount
+      : null,
+    previewExtractionSelectedMimeType: input.previewExtractionSelectedMimeType || null
+  };
+}
+
+function progressMessageText(input = {}) {
+  if (
+    input.previewExtractionStatus === "success" &&
+    input.extractedImageUrl &&
+    input.sourceType &&
+    input.sourceType !== "direct_image_url"
+  ) {
+    return "Found a preview image from this link. Analyzing...";
+  }
+
+  return "Searching the scene...";
 }
 
 function buildResultMessage(match, { trustedLowSimilarity = false } = {}) {
@@ -243,7 +363,7 @@ function sentTelegramMediaIds(sentMessage = {}) {
 async function sendResult(chatId, match, settings, { trustedLowSimilarity = false } = {}) {
   const caption = buildResultMessage(match, { trustedLowSimilarity });
 
-  if (settings.enableVideoPreview && match.videoUrl) {
+  if (match.videoUrl) {
     try {
       const sentMessage = await bot.sendVideo(chatId, match.videoUrl, {
         caption,
@@ -275,13 +395,13 @@ async function sendResult(chatId, match, settings, { trustedLowSimilarity = fals
   };
 }
 
-async function attachResultActions(chatId, messageId, activityId) {
+async function attachResultActions(chatId, messageId, activityId, settings) {
   if (!chatId || !messageId || !activityId) {
     return;
   }
 
   try {
-    await bot.editMessageReplyMarkup(resultActions(activityId), {
+    await bot.editMessageReplyMarkup(resultActions(activityId, settings), {
       chat_id: chatId,
       message_id: messageId
     });
@@ -290,11 +410,22 @@ async function attachResultActions(chatId, messageId, activityId) {
   }
 }
 
-async function sendFeatureMenu(chatId) {
+async function sendFeatureMenu(chatId, settings) {
+  const keyboard = moreMenuKeyboard(settings);
+
+  if (!keyboard.inline_keyboard.length) {
+    await bot.sendMessage(chatId, "Extra AniSeek features are disabled right now.");
+    return;
+  }
+
   await bot.sendMessage(chatId, "<b>AniSeek menu</b>", {
     parse_mode: "HTML",
-    reply_markup: moreMenuKeyboard()
+    reply_markup: keyboard
   });
+}
+
+async function sendFeatureDisabled(chatId, feature) {
+  await bot.sendMessage(chatId, feature?.disabledMessage || "That AniSeek feature is disabled right now.");
 }
 
 async function sendUsage(chatId, user, settings) {
@@ -322,7 +453,7 @@ async function sendStats(chatId, user) {
 }
 
 async function sendTrending(chatId, user, settings) {
-  const hours = Number(settings.trendingWindowHours) || 24;
+  const hours = TRENDING_WINDOW_HOURS;
   const items = await getTrendingSearches({
     hours,
     limit: 5
@@ -410,6 +541,7 @@ async function handleAnalysis(message, user, settings) {
   } catch (error) {
     const rejectionReason = error instanceof InputResolutionError ? error.rejectionReason : "processing_error";
     const failureType = isTechnicalFailureType(rejectionReason) ? rejectionReason : "processing_error";
+    const extraction = error instanceof InputResolutionError ? previewExtractionSnapshot(error) : {};
     const botResponse = {
       message: error.message
     };
@@ -417,15 +549,18 @@ async function handleAnalysis(message, user, settings) {
     await recordError({
       userId: user.telegramId,
       user: userSnapshot,
-      source: error.source || "unknown",
+      source: error.source || extraction.sourceType || "unknown",
       inputUrl: error.inputUrl || buildUserInput(message).url,
-      inputType: error.source || "unknown",
+      inputType: extraction.sourceType || error.source || "unknown",
       userInput: buildUserInput(message, {
         inputUrl: error.inputUrl,
-        source: error.source,
-        inputType: error.source
+        source: error.source || extraction.sourceType,
+        sourceType: extraction.sourceType,
+        inputType: extraction.sourceType || error.source,
+        ...extraction
       }),
-      media: buildActivityMedia(),
+      media: buildActivityMedia(extraction),
+      ...extraction,
       status: "failed",
       failureType,
       rejectionReason,
@@ -457,7 +592,7 @@ async function handleAnalysis(message, user, settings) {
       message: botResponse.message
     });
 
-    await bot.sendMessage(chatId, helpMessage(), {
+    await bot.sendMessage(chatId, helpMessage(settings), {
       parse_mode: "HTML"
     });
     return;
@@ -470,7 +605,7 @@ async function handleAnalysis(message, user, settings) {
     return;
   }
 
-  const progressMessage = await bot.sendMessage(chatId, "Searching the scene...");
+  const progressMessage = await bot.sendMessage(chatId, progressMessageText(input));
   let resultSent = false;
 
   try {
@@ -507,7 +642,7 @@ async function handleAnalysis(message, user, settings) {
         error: `Similarity is below ${threshold}%`
       });
 
-      await attachResultActions(chatId, sentMessage.message_id, activity.id);
+      await attachResultActions(chatId, sentMessage.message_id, activity.id, settings);
       return;
     }
 
@@ -536,7 +671,7 @@ async function handleAnalysis(message, user, settings) {
     });
 
     await updateActivitySentMedia(activity.id, sentMedia);
-    await attachResultActions(chatId, sentMedia.messageId, activity.id);
+    await attachResultActions(chatId, sentMedia.messageId, activity.id, settings);
     await incrementDailyUsage(user.telegramId);
   } catch (error) {
     if (resultSent) {
@@ -605,39 +740,36 @@ bot.on("message", async (message) => {
     const command = commandName(text);
 
     if (command === "/start" || command === "/help") {
-      await bot.sendMessage(message.chat.id, helpMessage(), {
+      await bot.sendMessage(message.chat.id, helpMessage(settings), {
         parse_mode: "HTML"
       });
       return;
     }
 
-    if (command === "/usage") {
-      await sendUsage(message.chat.id, user, settings);
-      return;
-    }
+    const featureCommand = featureByCommand(command);
 
-    if (command === "/stats") {
-      await sendStats(message.chat.id, user);
-      return;
-    }
+    if (featureCommand) {
+      if (!isFeatureEnabled(settings, featureCommand.key)) {
+        await sendFeatureDisabled(message.chat.id, featureCommand);
+        return;
+      }
 
-    if (command === "/trending") {
-      await sendTrending(message.chat.id, user, settings);
-      return;
-    }
-
-    if (command === "/random") {
-      await sendRandom(message.chat.id, user, settings);
-      return;
-    }
-
-    if (command === "/top") {
-      await sendTop(message.chat.id, user, settings);
+      if (featureCommand.key === "usage") {
+        await sendUsage(message.chat.id, user, settings);
+      } else if (featureCommand.key === "stats") {
+        await sendStats(message.chat.id, user);
+      } else if (featureCommand.key === "trending") {
+        await sendTrending(message.chat.id, user, settings);
+      } else if (featureCommand.key === "random") {
+        await sendRandom(message.chat.id, user, settings);
+      } else if (featureCommand.key === "top") {
+        await sendTop(message.chat.id, user, settings);
+      }
       return;
     }
 
     if (command.startsWith("/")) {
-      await bot.sendMessage(message.chat.id, helpMessage(), {
+      await bot.sendMessage(message.chat.id, helpMessage(settings), {
         parse_mode: "HTML"
       });
       return;
@@ -712,37 +844,31 @@ bot.on("callback_query", async (query) => {
         activityId
       });
       await bot.answerCallbackQuery(query.id);
-      await sendFeatureMenu(chatId);
+      await sendFeatureMenu(chatId, settings);
       return;
     }
 
-    if (data === "usage") {
-      await bot.answerCallbackQuery(query.id);
-      await sendUsage(chatId, user, settings);
-      return;
-    }
+    const featureCallback = featureByCallbackData(data);
 
-    if (data === "stats") {
+    if (featureCallback) {
       await bot.answerCallbackQuery(query.id);
-      await sendStats(chatId, user);
-      return;
-    }
 
-    if (data === "trend") {
-      await bot.answerCallbackQuery(query.id);
-      await sendTrending(chatId, user, settings);
-      return;
-    }
+      if (!isFeatureEnabled(settings, featureCallback.key)) {
+        await sendFeatureDisabled(chatId, featureCallback);
+        return;
+      }
 
-    if (data === "random") {
-      await bot.answerCallbackQuery(query.id);
-      await sendRandom(chatId, user, settings);
-      return;
-    }
-
-    if (data === "top") {
-      await bot.answerCallbackQuery(query.id);
-      await sendTop(chatId, user, settings);
+      if (featureCallback.key === "usage") {
+        await sendUsage(chatId, user, settings);
+      } else if (featureCallback.key === "stats") {
+        await sendStats(chatId, user);
+      } else if (featureCallback.key === "trending") {
+        await sendTrending(chatId, user, settings);
+      } else if (featureCallback.key === "random") {
+        await sendRandom(chatId, user, settings);
+      } else if (featureCallback.key === "top") {
+        await sendTop(chatId, user, settings);
+      }
       return;
     }
 
