@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   filterAndRankDiscoveredImages,
+  resolveTelegramPreviewFallback,
   resolveMaxDiscoveredImages,
   selectAnalysisImage
 } from "../src/services/linkExtractorService.js";
@@ -147,4 +148,46 @@ test("filterAndRankDiscoveredImages does not let score outrank larger known dime
   });
 
   assert.equal(ranked[0].url, "https://cdn.example.test/known-large.jpg");
+});
+
+test("resolveTelegramPreviewFallback uses Telegram web page preview image", async () => {
+  process.env.BOT_TOKEN = "123456:test-token";
+  const bot = {
+    async getFile(fileId) {
+      assert.equal(fileId, "telegram-preview-file-id");
+      return {
+        file_path: "photos/preview.jpg"
+      };
+    }
+  };
+  const input = await resolveTelegramPreviewFallback({
+    web_page: {
+      photo: {
+        sizes: [
+          {
+            file_id: "small-preview-file-id",
+            width: 90,
+            height: 90
+          },
+          {
+            file_id: "telegram-preview-file-id",
+            width: 640,
+            height: 360
+          }
+        ]
+      }
+    }
+  }, bot, "https://www.reddit.com/r/anime/comments/example", {
+    metadata: {
+      bestImage: "https://blocked.example.test/image.jpg",
+      images: []
+    },
+    reason: "provider_blocked"
+  });
+
+  assert.equal(input.fallbackUsed, "telegram_preview");
+  assert.equal(input.telegramPreviewUsed, true);
+  assert.equal(input.sourceType, "telegram_link_preview");
+  assert.equal(input.previewExtractionMethod, "telegram:web_page_preview:provider_blocked");
+  assert.equal(input.imageUrl, "https://api.telegram.org/file/bot123456:test-token/photos/preview.jpg");
 });

@@ -26,6 +26,13 @@ import {
   resolveMaxDiscoveredImages,
   resolveTrustedLinkSelection
 } from "./services/linkExtractorService.js";
+import {
+  createDiscoveredImagesCollage,
+  discoveredImagesKeyboard as buildDiscoveredImagesKeyboard,
+  parseImageSelectionCallbackData,
+  selectedImageConfirmationKeyboard
+} from "./services/imageSelectionService.js";
+import { withTemporaryMessage } from "./services/telegramMessageService.js";
 
 const token = process.env.BOT_TOKEN;
 
@@ -160,21 +167,7 @@ function formatDiscoveredImagesMessage(images = []) {
 }
 
 function discoveredImagesKeyboard(selectionId, images = []) {
-  const rows = [];
-
-  for (let index = 0; index < images.length; index += 5) {
-    rows.push(images.slice(index, index + 5).map((_, offset) => {
-      const imageIndex = index + offset;
-      return {
-        text: String(imageIndex + 1),
-        callback_data: `imgselect:${selectionId}:${imageIndex}`
-      };
-    }));
-  }
-
-  return {
-    inline_keyboard: rows
-  };
+  return buildDiscoveredImagesKeyboard(selectionId, images);
 }
 
 async function sendTrustedLinkSelection(chatId, selectionId) {
@@ -215,6 +208,54 @@ async function clearCallbackMarkup(query) {
     chat_id: chatId,
     message_id: messageId
   }).catch(() => {});
+}
+
+async function sendDiscoveredImageSelection(chatId, selectionId, selection, settings) {
+  const maxImages = resolveMaxDiscoveredImages(settings);
+  const visibleImages = selection.images.slice(0, maxImages);
+
+  if (!visibleImages.length) {
+    await bot.sendMessage(chatId, "No useful discovered images are available. Use the best image or send the image directly.");
+    return false;
+  }
+
+  const replyMarkup = discoveredImagesKeyboard(selectionId, visibleImages);
+
+  try {
+    const collage = await createDiscoveredImagesCollage(visibleImages);
+
+    if (collage) {
+      await bot.sendPhoto(chatId, collage, {
+        caption: "Choose an image to analyze.",
+        reply_markup: replyMarkup
+      });
+      return true;
+    }
+  } catch (error) {
+    console.warn("Could not send discovered image collage.", error.message);
+  }
+
+  await bot.sendMessage(chatId, formatDiscoveredImagesMessage(visibleImages), {
+    parse_mode: "HTML",
+    reply_markup: replyMarkup
+  });
+  return true;
+}
+
+async function sendSelectedImagePreview(chatId, selectionId, imageIndex, selectedImage) {
+  const options = {
+    caption: `Image ${imageIndex + 1} selected. Confirm when you are ready to analyze it.`,
+    reply_markup: selectedImageConfirmationKeyboard(selectionId, imageIndex)
+  };
+
+  try {
+    await bot.sendPhoto(chatId, selectedImage.url, options);
+  } catch (error) {
+    console.warn("Could not send selected image preview.", error.message);
+    await bot.sendMessage(chatId, options.caption, {
+      reply_markup: options.reply_markup
+    });
+  }
 }
 
 function escapeHtml(value) {
@@ -891,27 +932,40 @@ async function runResolvedAnalysis(message, user, settings, input) {
 
 async function handleAnalysis(message, user, settings) {
   let input;
+  let selectionId = null;
+  const hasLink = extractUrls(message).length > 0;
 
   try {
-    if (isTrustedUser(user)) {
-      const trustedSelection = await resolveTrustedLinkSelection(message, bot, settings, {
-        trustedUser: true
-      });
+    await withTemporaryMessage({
+      bot,
+      chatId: message.chat.id,
+      text: "Analyzing the link and extracting images...",
+      enabled: hasLink
+    }, async () => {
+      if (isTrustedUser(user)) {
+        const trustedSelection = await resolveTrustedLinkSelection(message, bot, settings, {
+          trustedUser: true
+        });
 
-      if (trustedSelection?.type === "selection") {
-        const selectionId = storeImageSelection(message, user, trustedSelection);
-        await sendTrustedLinkSelection(message.chat.id, selectionId);
-        return;
+        if (trustedSelection?.type === "selection") {
+          selectionId = storeImageSelection(message, user, trustedSelection);
+          return;
+        }
+
+        if (trustedSelection?.type === "input") {
+          input = trustedSelection.input;
+        }
       }
 
-      if (trustedSelection?.type === "input") {
-        input = trustedSelection.input;
-      }
-    }
-
-    input = input || await resolveImageInput(message, bot, settings);
+      input = input || await resolveImageInput(message, bot, settings);
+    });
   } catch (error) {
     await recordInputResolutionFailure(message, user, error);
+    return;
+  }
+
+  if (selectionId) {
+    await sendTrustedLinkSelection(message.chat.id, selectionId);
     return;
   }
 
@@ -1008,12 +1062,13 @@ bot.on("message", async (message) => {
 
 async function handleImageSelectionCallback(query, settings, user) {
   const data = String(query.data || "");
-  const [action, selectionId, rawIndex] = data.split(":");
+  const parsed = parseImageSelectionCallbackData(data);
 
-  if (!["imgbest", "imglist", "imgselect"].includes(action)) {
+  if (!parsed) {
     return false;
   }
 
+  const { action, selectionId, imageIndex } = parsed;
   const selection = getImageSelection(selectionId);
   const chatId = query.message?.chat?.id;
 
@@ -1064,21 +1119,20 @@ async function handleImageSelectionCallback(query, settings, user) {
     }
 
     await bot.answerCallbackQuery(query.id);
-    const text = formatDiscoveredImagesMessage(visibleImages);
-    const options = {
-      parse_mode: "HTML",
-      reply_markup: discoveredImagesKeyboard(selectionId, visibleImages)
-    };
-    const edited = await replaceCallbackMessage(query, text, options);
-
-    if (!edited) {
-      await bot.sendMessage(chatId, text, options);
-    }
-
+    await clearCallbackMarkup(query);
+    await sendDiscoveredImageSelection(chatId, selectionId, selection, settings);
     return true;
   }
 
-  const imageIndex = Number.parseInt(rawIndex, 10);
+  if (action === "imgback") {
+    await bot.answerCallbackQuery(query.id, {
+      text: "Back to image selection."
+    });
+    await clearCallbackMarkup(query);
+    await sendDiscoveredImageSelection(chatId, selectionId, selection, settings);
+    return true;
+  }
+
   const selectedImage = Number.isInteger(imageIndex) ? visibleImages[imageIndex] : null;
 
   if (!selectedImage) {
@@ -1088,28 +1142,38 @@ async function handleImageSelectionCallback(query, settings, user) {
     return true;
   }
 
+  if (action === "imgpick" || action === "imgselect") {
+    await bot.answerCallbackQuery(query.id, {
+      text: `Image ${imageIndex + 1} selected.`
+    });
+    await clearCallbackMarkup(query);
+    await sendSelectedImagePreview(chatId, selectionId, imageIndex, selectedImage);
+    return true;
+  }
+
+  if (action !== "imgconfirm") {
+    return false;
+  }
+
   await bot.answerCallbackQuery(query.id, {
-    text: `Using image ${imageIndex + 1}.`
+    text: `Analyzing image ${imageIndex + 1}.`
   });
 
-  let input;
-
   try {
-    input = await resolveDiscoveredImageInput({
+    const input = await resolveDiscoveredImageInput({
       url: selection.url,
       sourceType: selection.sourceType,
       metadata: selection.metadata,
       image: selectedImage,
       candidateCount: selection.images.length
     });
+    imageSelections.delete(selectionId);
+    await clearCallbackMarkup(query);
+    await runResolvedAnalysis(selection.message, user, settings, input);
   } catch (error) {
     await recordInputResolutionFailure(selection.message, user, error);
-    return true;
   }
 
-  imageSelections.delete(selectionId);
-  await replaceCallbackMessage(query, `Image ${imageIndex + 1} selected. Analyzing...`);
-  await runResolvedAnalysis(selection.message, user, settings, input);
   return true;
 }
 

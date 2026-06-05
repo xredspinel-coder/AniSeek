@@ -786,7 +786,7 @@ function telegramPreviewFileId(message = {}) {
   return null;
 }
 
-async function resolveTelegramPreviewFallback(message, bot, url, {
+export async function resolveTelegramPreviewFallback(message, bot, url, {
   metadata = null,
   sourceType = TELEGRAM_PREVIEW_SOURCE_TYPE,
   trustedUser = false,

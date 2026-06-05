@@ -5,7 +5,7 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "build": "node --check src/index.js && node --check src/bot.js && node --check src/services/linkExtractorService.js",
+    "build": "node --check src/index.js && node --check src/bot.js && node --check src/services/linkExtractorService.js && node --check src/services/imageSelectionService.js && node --check src/services/telegramMessageService.js",
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
     "set:webhook": "node scripts/setWebhook.js",
@@ -16,7 +16,8 @@
     "express": "^4.21.2",
     "firebase-admin": "^13.0.2",
     "metanova": "^0.2.2",
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "sharp": "^0.34.5"
   },
   "engines": {
     "node": ">=20"
