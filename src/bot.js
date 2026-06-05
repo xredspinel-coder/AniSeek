@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import TelegramBot from "node-telegram-bot-api";
 import { getSettings } from "./services/settingsService.js";
 import { getOrCreateUser } from "./services/userService.js";
@@ -13,10 +14,18 @@ import {
   getTrendingSearches,
   getUsageSummary,
   getUserStatsSummary,
+  isTrustedUser,
   recordBotEvent,
   setWrongMatchReason
 } from "./services/featureService.js";
-import { InputResolutionError, extractUrls, resolveImageInput } from "./services/linkExtractorService.js";
+import {
+  InputResolutionError,
+  extractUrls,
+  resolveDiscoveredImageInput,
+  resolveImageInput,
+  resolveMaxDiscoveredImages,
+  resolveTrustedLinkSelection
+} from "./services/linkExtractorService.js";
 
 const token = process.env.BOT_TOKEN;
 
@@ -29,6 +38,8 @@ export const bot = new TelegramBot(token, {
 });
 
 const TRENDING_WINDOW_HOURS = 24;
+const IMAGE_SELECTION_TTL_MS = 15 * 60 * 1000;
+const imageSelections = new Map();
 const FEATURE_ITEMS = [
   {
     key: "usage",
@@ -36,7 +47,7 @@ const FEATURE_ITEMS = [
     label: "📊 My Usage",
     callbackData: "usage",
     command: "/usage",
-    disabledMessage: "My Usage is disabled right now."
+    disabledMessage: "This feature is not available right now."
   },
   {
     key: "stats",
@@ -44,7 +55,7 @@ const FEATURE_ITEMS = [
     label: "📈 My Statistics",
     callbackData: "stats",
     command: "/stats",
-    disabledMessage: "My Statistics is disabled right now."
+    disabledMessage: "This feature is not available right now."
   },
   {
     key: "trending",
@@ -52,7 +63,7 @@ const FEATURE_ITEMS = [
     label: "🔥 Trending Searches",
     callbackData: "trend",
     command: "/trending",
-    disabledMessage: "Trending Searches is disabled right now."
+    disabledMessage: "This feature is not available right now."
   },
   {
     key: "random",
@@ -60,7 +71,7 @@ const FEATURE_ITEMS = [
     label: "🎲 Random Anime",
     callbackData: "random",
     command: "/random",
-    disabledMessage: "Random Anime is disabled right now."
+    disabledMessage: "This feature is not available right now."
   },
   {
     key: "top",
@@ -68,9 +79,143 @@ const FEATURE_ITEMS = [
     label: "🏆 Top Anime",
     callbackData: "top",
     command: "/top",
-    disabledMessage: "Top Anime is disabled right now."
+    disabledMessage: "This feature is not available right now."
   }
 ];
+
+function pruneImageSelections(now = Date.now()) {
+  for (const [selectionId, selection] of imageSelections.entries()) {
+    if (now - selection.createdAt > IMAGE_SELECTION_TTL_MS) {
+      imageSelections.delete(selectionId);
+    }
+  }
+}
+
+function messageSnapshot(message) {
+  return {
+    message_id: message.message_id || null,
+    text: message.text || null,
+    caption: message.caption || null,
+    chat: {
+      id: message.chat?.id || null
+    },
+    from: message.from || null
+  };
+}
+
+function storeImageSelection(message, user, selection) {
+  pruneImageSelections();
+
+  const selectionId = crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+  imageSelections.set(selectionId, {
+    id: selectionId,
+    userId: String(user.telegramId || user.id || message.from?.id || ""),
+    chatId: String(message.chat?.id || ""),
+    message: messageSnapshot(message),
+    url: selection.url,
+    sourceType: selection.sourceType,
+    metadata: selection.metadata,
+    bestInput: selection.bestInput,
+    images: selection.images,
+    createdAt: Date.now()
+  });
+
+  return selectionId;
+}
+
+function getImageSelection(selectionId) {
+  pruneImageSelections();
+  return imageSelections.get(selectionId) || null;
+}
+
+function trustedLinkKeyboard(selectionId) {
+  return {
+    inline_keyboard: [
+      [{ text: "Use best image", callback_data: `imgbest:${selectionId}` }],
+      [{ text: "Show discovered images", callback_data: `imglist:${selectionId}` }]
+    ]
+  };
+}
+
+function imageDimensionLabel(image = {}) {
+  if (Number.isFinite(image.width) && Number.isFinite(image.height)) {
+    return `${image.width}x${image.height}`;
+  }
+
+  return "Unknown size";
+}
+
+function imageSourceLabel(image = {}) {
+  return String(image.source || image.title || image.alt || "metadata image")
+    .replace(/[_-]+/g, " ")
+    .slice(0, 80);
+}
+
+function formatDiscoveredImagesMessage(images = []) {
+  return [
+    "<b>Choose an image to analyze:</b>",
+    "",
+    ...images.map((image, index) => `${index + 1}. ${escapeHtml(imageDimensionLabel(image))} - ${escapeHtml(imageSourceLabel(image))}`)
+  ].join("\n");
+}
+
+function discoveredImagesKeyboard(selectionId, images = []) {
+  const rows = [];
+
+  for (let index = 0; index < images.length; index += 5) {
+    rows.push(images.slice(index, index + 5).map((_, offset) => {
+      const imageIndex = index + offset;
+      return {
+        text: String(imageIndex + 1),
+        callback_data: `imgselect:${selectionId}:${imageIndex}`
+      };
+    }));
+  }
+
+  return {
+    inline_keyboard: rows
+  };
+}
+
+async function sendTrustedLinkSelection(chatId, selectionId) {
+  await bot.sendMessage(chatId, "I found images in that link. Choose how you want to continue.", {
+    reply_markup: trustedLinkKeyboard(selectionId)
+  });
+}
+
+async function replaceCallbackMessage(query, text, options = {}) {
+  const chatId = query.message?.chat?.id;
+  const messageId = query.message?.message_id;
+
+  if (!chatId || !messageId) {
+    return false;
+  }
+
+  try {
+    await bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: messageId,
+      ...options
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function clearCallbackMarkup(query) {
+  const chatId = query.message?.chat?.id;
+  const messageId = query.message?.message_id;
+
+  if (!chatId || !messageId) {
+    return;
+  }
+
+  await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
+    chat_id: chatId,
+    message_id: messageId
+  }).catch(() => {});
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -310,7 +455,15 @@ function previewExtractionSnapshot(input = {}) {
     previewExtractionCandidateCount: Number.isFinite(input.previewExtractionCandidateCount)
       ? input.previewExtractionCandidateCount
       : null,
-    previewExtractionSelectedMimeType: input.previewExtractionSelectedMimeType || null
+    previewExtractionSelectedMimeType: input.previewExtractionSelectedMimeType || null,
+    providerDiagnostics: input.providerDiagnostics || null,
+    provider: input.provider || input.providerDiagnostics?.platform || null,
+    bestImageUrl: input.bestImageUrl || null,
+    selectedImageUrl: input.selectedImageUrl || input.extractedImageUrl || null,
+    imageCount: input.imageCount ?? input.previewExtractionCandidateCount ?? null,
+    filteredImageCount: input.filteredImageCount ?? null,
+    fallbackUsed: input.fallbackUsed || null,
+    telegramPreviewUsed: Boolean(input.telegramPreviewUsed || input.fallbackUsed === "telegram_preview")
   };
 }
 
@@ -325,6 +478,75 @@ function progressMessageText(input = {}) {
   }
 
   return "Searching the scene...";
+}
+
+function inputResolutionUserMessage(error) {
+  if (!(error instanceof InputResolutionError)) {
+    return "I could not process that request. Please send an anime screenshot or a supported image link.";
+  }
+
+  if (error.rejectionReason === "telegram_download_error") {
+    return "I could not download that Telegram image. Please send it again or upload the image directly.";
+  }
+
+  if (error.rejectionReason === "unsupported_source") {
+    return "This feature is not available right now.";
+  }
+
+  if (error.rejectionReason === "invalid_url") {
+    return "That link is not supported. Please send a public http:// or https:// image link.";
+  }
+
+  if (error.rejectionReason === "metadata_fetch_error") {
+    return "I could not open this link. Try another link or send the image directly.";
+  }
+
+  if (error.rejectionReason === "provider_blocked") {
+    return "I could not extract a suitable image from this link. If Telegram shows a preview image, I will try to use it. Otherwise, send the image directly.";
+  }
+
+  if (error.rejectionReason === "invalid_media") {
+    return "I could not find a usable image in that message. Please send the image directly or try another link.";
+  }
+
+  return "I could not open that link. Please try another link or send the image directly.";
+}
+
+async function recordInputResolutionFailure(message, user, error) {
+  const chatId = message.chat.id;
+  const userSnapshot = buildUserSnapshot(user);
+  const rejectionReason = error instanceof InputResolutionError ? error.rejectionReason : "processing_error";
+  const failureType = isTechnicalFailureType(rejectionReason) ? rejectionReason : "processing_error";
+  const extraction = error instanceof InputResolutionError ? previewExtractionSnapshot(error) : {};
+  const userMessage = inputResolutionUserMessage(error);
+  const botResponse = {
+    message: userMessage
+  };
+
+  await recordError({
+    userId: user.telegramId,
+    user: userSnapshot,
+    source: error.source || extraction.sourceType || "unknown",
+    inputUrl: error.inputUrl || buildUserInput(message).url,
+    inputType: extraction.sourceType || error.source || "unknown",
+    userInput: buildUserInput(message, {
+      inputUrl: error.inputUrl,
+      source: error.source || extraction.sourceType,
+      sourceType: extraction.sourceType,
+      inputType: extraction.sourceType || error.source,
+      ...extraction
+    }),
+    media: buildActivityMedia(extraction),
+    ...extraction,
+    status: "failed",
+    failureType,
+    rejectionReason,
+    botResponse,
+    message: error.message,
+    stack: error.stack
+  });
+
+  await bot.sendMessage(chatId, userMessage);
 }
 
 function buildResultMessage(match, { trustedLowSimilarity = false } = {}) {
@@ -414,7 +636,7 @@ async function sendFeatureMenu(chatId, settings) {
   const keyboard = moreMenuKeyboard(settings);
 
   if (!keyboard.inline_keyboard.length) {
-    await bot.sendMessage(chatId, "Extra AniSeek features are disabled right now.");
+    await bot.sendMessage(chatId, "Extra AniSeek features are not available right now.");
     return;
   }
 
@@ -425,7 +647,7 @@ async function sendFeatureMenu(chatId, settings) {
 }
 
 async function sendFeatureDisabled(chatId, feature) {
-  await bot.sendMessage(chatId, feature?.disabledMessage || "That AniSeek feature is disabled right now.");
+  await bot.sendMessage(chatId, feature?.disabledMessage || "This feature is not available right now.");
 }
 
 async function sendUsage(chatId, user, settings) {
@@ -482,7 +704,7 @@ async function sendRandom(chatId, user, settings) {
   });
 
   if (!settings.enableRandomAnime) {
-    await bot.sendMessage(chatId, "Random anime is disabled right now.");
+    await bot.sendMessage(chatId, "This feature is not available right now.");
     return;
   }
 
@@ -517,7 +739,7 @@ async function sendTop(chatId, user, settings) {
   });
 
   if (!settings.enableTopAnime) {
-    await bot.sendMessage(chatId, "Top anime is disabled right now.");
+    await bot.sendMessage(chatId, "This feature is not available right now.");
     return;
   }
 
@@ -531,72 +753,9 @@ async function sendTop(chatId, user, settings) {
   });
 }
 
-async function handleAnalysis(message, user, settings) {
+async function runResolvedAnalysis(message, user, settings, input) {
   const chatId = message.chat.id;
   const userSnapshot = buildUserSnapshot(user);
-  let input;
-
-  try {
-    input = await resolveImageInput(message, bot, settings);
-  } catch (error) {
-    const rejectionReason = error instanceof InputResolutionError ? error.rejectionReason : "processing_error";
-    const failureType = isTechnicalFailureType(rejectionReason) ? rejectionReason : "processing_error";
-    const extraction = error instanceof InputResolutionError ? previewExtractionSnapshot(error) : {};
-    const botResponse = {
-      message: error.message
-    };
-
-    await recordError({
-      userId: user.telegramId,
-      user: userSnapshot,
-      source: error.source || extraction.sourceType || "unknown",
-      inputUrl: error.inputUrl || buildUserInput(message).url,
-      inputType: extraction.sourceType || error.source || "unknown",
-      userInput: buildUserInput(message, {
-        inputUrl: error.inputUrl,
-        source: error.source || extraction.sourceType,
-        sourceType: extraction.sourceType,
-        inputType: extraction.sourceType || error.source,
-        ...extraction
-      }),
-      media: buildActivityMedia(extraction),
-      ...extraction,
-      status: "failed",
-      failureType,
-      rejectionReason,
-      botResponse,
-      message: error.message,
-      stack: error.stack
-    });
-
-    await bot.sendMessage(chatId, error.message);
-    return;
-  }
-
-  if (!input) {
-    const botResponse = {
-      message: "Send an anime screenshot, a forwarded image, a direct image URL, or a supported social link."
-    };
-
-    await recordError({
-      userId: user.telegramId,
-      user: userSnapshot,
-      source: "unknown",
-      inputType: "unknown",
-      userInput: buildUserInput(message),
-      media: buildActivityMedia(),
-      status: "failed",
-      failureType: "invalid_media",
-      rejectionReason: "invalid_media",
-      botResponse,
-      message: botResponse.message
-    });
-
-    await bot.sendMessage(chatId, helpMessage(settings), {
-      parse_mode: "HTML"
-    });
-    return;
-  }
 
   const access = await checkAnalysisAccess(user, settings);
 
@@ -615,7 +774,7 @@ async function handleAnalysis(message, user, settings) {
 
     if (match.similarity < threshold && !trustedLowSimilarity) {
       const messageText = [
-        `No confident match. Best result was ${match.similarity}%, below the ${threshold}% threshold.`,
+        `I could not find a confident match for this image. Best result: ${match.similarity}%.`,
         "",
         buildResultMessage(match)
       ].join("\n");
@@ -682,7 +841,9 @@ async function handleAnalysis(message, user, settings) {
     const isNoMatch = /did not return a match|no result/i.test(error.message);
     const status = isNoMatch ? "rejected" : "failed";
     const rejectionReason = isNoMatch ? "no_match" : "trace_api_error";
-    const messageText = `I could not analyze that image: ${error.message}`;
+    const messageText = isNoMatch
+      ? "I could not find a match for that image. Try a clearer screenshot or another frame."
+      : "I could not analyze that image right now. Please try again in a little while.";
 
     if (isNoMatch) {
       await recordActivity({
@@ -726,6 +887,60 @@ async function handleAnalysis(message, user, settings) {
   } finally {
     bot.deleteMessage(chatId, progressMessage.message_id).catch(() => {});
   }
+}
+
+async function handleAnalysis(message, user, settings) {
+  let input;
+
+  try {
+    if (isTrustedUser(user)) {
+      const trustedSelection = await resolveTrustedLinkSelection(message, bot, settings, {
+        trustedUser: true
+      });
+
+      if (trustedSelection?.type === "selection") {
+        const selectionId = storeImageSelection(message, user, trustedSelection);
+        await sendTrustedLinkSelection(message.chat.id, selectionId);
+        return;
+      }
+
+      if (trustedSelection?.type === "input") {
+        input = trustedSelection.input;
+      }
+    }
+
+    input = input || await resolveImageInput(message, bot, settings);
+  } catch (error) {
+    await recordInputResolutionFailure(message, user, error);
+    return;
+  }
+
+  if (!input) {
+    const botResponse = {
+      message: "Send an anime screenshot, a forwarded image, a direct image URL, or a supported social link."
+    };
+
+    await recordError({
+      userId: user.telegramId,
+      user: buildUserSnapshot(user),
+      source: "unknown",
+      inputType: "unknown",
+      userInput: buildUserInput(message),
+      media: buildActivityMedia(),
+      status: "failed",
+      failureType: "invalid_media",
+      rejectionReason: "invalid_media",
+      botResponse,
+      message: botResponse.message
+    });
+
+    await bot.sendMessage(message.chat.id, helpMessage(settings), {
+      parse_mode: "HTML"
+    });
+    return;
+  }
+
+  await runResolvedAnalysis(message, user, settings, input);
 }
 
 bot.on("message", async (message) => {
@@ -779,7 +994,7 @@ bot.on("message", async (message) => {
   } catch (error) {
     console.error("Message handling failed.", error);
     if (message.chat?.id) {
-      await bot.sendMessage(message.chat.id, "AniSeek hit an internal error. The error was logged.");
+      await bot.sendMessage(message.chat.id, "Something went wrong. Please try again in a little while.");
     }
 
     await recordError({
@@ -790,6 +1005,113 @@ bot.on("message", async (message) => {
     }).catch(() => {});
   }
 });
+
+async function handleImageSelectionCallback(query, settings, user) {
+  const data = String(query.data || "");
+  const [action, selectionId, rawIndex] = data.split(":");
+
+  if (!["imgbest", "imglist", "imgselect"].includes(action)) {
+    return false;
+  }
+
+  const selection = getImageSelection(selectionId);
+  const chatId = query.message?.chat?.id;
+
+  if (!selection) {
+    await bot.answerCallbackQuery(query.id, {
+      text: "This image selection expired. Send the link again."
+    });
+    await clearCallbackMarkup(query);
+    return true;
+  }
+
+  if (selection.userId !== String(query.from?.id || "")) {
+    await bot.answerCallbackQuery(query.id, {
+      text: "This image selection belongs to another user.",
+      show_alert: true
+    });
+    return true;
+  }
+
+  if (selection.chatId !== String(chatId || "")) {
+    await bot.answerCallbackQuery(query.id, {
+      text: "This image selection is not available in this chat.",
+      show_alert: true
+    });
+    return true;
+  }
+
+  if (action === "imgbest") {
+    imageSelections.delete(selectionId);
+    await bot.answerCallbackQuery(query.id, {
+      text: "Using the best image."
+    });
+    await replaceCallbackMessage(query, "Using the best image. Analyzing...");
+    await runResolvedAnalysis(selection.message, user, settings, selection.bestInput);
+    return true;
+  }
+
+  const maxImages = resolveMaxDiscoveredImages(settings);
+  const visibleImages = selection.images.slice(0, maxImages);
+
+  if (action === "imglist") {
+    if (!visibleImages.length) {
+      await bot.answerCallbackQuery(query.id, {
+        text: "No discovered images are available."
+      });
+      await bot.sendMessage(chatId, "No useful discovered images are available. Use the best image or send the image directly.");
+      return true;
+    }
+
+    await bot.answerCallbackQuery(query.id);
+    const text = formatDiscoveredImagesMessage(visibleImages);
+    const options = {
+      parse_mode: "HTML",
+      reply_markup: discoveredImagesKeyboard(selectionId, visibleImages)
+    };
+    const edited = await replaceCallbackMessage(query, text, options);
+
+    if (!edited) {
+      await bot.sendMessage(chatId, text, options);
+    }
+
+    return true;
+  }
+
+  const imageIndex = Number.parseInt(rawIndex, 10);
+  const selectedImage = Number.isInteger(imageIndex) ? visibleImages[imageIndex] : null;
+
+  if (!selectedImage) {
+    await bot.answerCallbackQuery(query.id, {
+      text: "That image choice is no longer available."
+    });
+    return true;
+  }
+
+  await bot.answerCallbackQuery(query.id, {
+    text: `Using image ${imageIndex + 1}.`
+  });
+
+  let input;
+
+  try {
+    input = await resolveDiscoveredImageInput({
+      url: selection.url,
+      sourceType: selection.sourceType,
+      metadata: selection.metadata,
+      image: selectedImage,
+      candidateCount: selection.images.length
+    });
+  } catch (error) {
+    await recordInputResolutionFailure(selection.message, user, error);
+    return true;
+  }
+
+  imageSelections.delete(selectionId);
+  await replaceCallbackMessage(query, `Image ${imageIndex + 1} selected. Analyzing...`);
+  await runResolvedAnalysis(selection.message, user, settings, input);
+  return true;
+}
 
 bot.on("callback_query", async (query) => {
   const data = String(query.data || "");
@@ -804,6 +1126,10 @@ bot.on("callback_query", async (query) => {
     const user = await getOrCreateUser({
       from: query.from
     });
+
+    if (await handleImageSelectionCallback(query, settings, user)) {
+      return;
+    }
 
     if (data.startsWith("wrong:")) {
       const activityId = data.slice("wrong:".length);
@@ -837,12 +1163,26 @@ bot.on("callback_query", async (query) => {
 
     if (data.startsWith("more:")) {
       const activityId = data.slice("more:".length);
+      const hasEnabledFeatures = enabledFeatureItems(settings).length > 0;
 
       await recordBotEvent("user_opened_more_menu", {
         user,
         chatId,
         activityId
       });
+
+      if (!hasEnabledFeatures) {
+        await bot.answerCallbackQuery(query.id, {
+          text: "This feature is not available right now."
+        });
+        await bot.editMessageReplyMarkup(resultActions(activityId, settings), {
+          chat_id: chatId,
+          message_id: query.message.message_id
+        }).catch(() => {});
+        await sendFeatureDisabled(chatId);
+        return;
+      }
+
       await bot.answerCallbackQuery(query.id);
       await sendFeatureMenu(chatId, settings);
       return;
@@ -851,12 +1191,15 @@ bot.on("callback_query", async (query) => {
     const featureCallback = featureByCallbackData(data);
 
     if (featureCallback) {
-      await bot.answerCallbackQuery(query.id);
-
       if (!isFeatureEnabled(settings, featureCallback.key)) {
+        await bot.answerCallbackQuery(query.id, {
+          text: "This feature is not available right now."
+        });
         await sendFeatureDisabled(chatId, featureCallback);
         return;
       }
+
+      await bot.answerCallbackQuery(query.id);
 
       if (featureCallback.key === "usage") {
         await sendUsage(chatId, user, settings);
@@ -878,7 +1221,7 @@ bot.on("callback_query", async (query) => {
   } catch (error) {
     console.error("Callback handling failed.", error);
     await bot.answerCallbackQuery(query.id, {
-      text: "AniSeek hit an internal error."
+      text: "Something went wrong. Please try again."
     }).catch(() => {});
     await recordError({
       userId: query.from?.id,

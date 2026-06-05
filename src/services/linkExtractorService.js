@@ -1,24 +1,32 @@
 import { lookup } from "node:dns/promises";
 import net from "node:net";
-import * as cheerio from "cheerio";
+import { fetchMetadata } from "metanova";
 
-const IMAGE_EXTENSION_PATTERN = /\.(gif|jpe?g|png|webp)(\?.*)?$/i;
+const IMAGE_EXTENSION_PATTERN = /\.(gif|jpe?g|png|webp)(?:[?#].*)?$/i;
 const URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
-const MAX_HTML_BYTES = 1_000_000;
 const MAX_IMAGE_BYTES = 8_000_000;
+const MAX_METADATA_BYTES = 1_000_000;
 const MAX_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 8_000;
 const TELEGRAM_FILE_TIMEOUT_MS = 12_000;
+const DEFAULT_MAX_DISCOVERED_IMAGES = 5;
+const MAX_DISCOVERED_IMAGES_LIMIT = 20;
 const BROWSER_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 AniSeekBot/1.0";
 const DIRECT_IMAGE_SOURCE_TYPE = "direct_image_url";
 const GENERIC_SOURCE_TYPE = "generic_link_preview";
+const TELEGRAM_PREVIEW_SOURCE_TYPE = "telegram_link_preview";
+const METANOVA_METHOD = "metanova:fetchMetadata";
+const METANOVA_BEST_IMAGE_METHOD = "metanova:bestImage";
+const TELEGRAM_PREVIEW_METHOD = "telegram:web_page_preview";
 const PLATFORM_SOURCE_TYPES = {
   reddit: "reddit_preview",
   twitter: "twitter_preview",
   facebook: "facebook_preview"
 };
+const WEAK_IMAGE_TEXT_PATTERN =
+  /avatar|favicon|emoji|award|sprite|pixel|placeholder|community[-_\s]*icon|subreddit[-_\s]*icon|profile[-_\s]*(?:image|photo|picture)?|channel[-_\s]*icon|\bicon\b/i;
 
 export class InputResolutionError extends Error {
   constructor(
@@ -35,7 +43,14 @@ export class InputResolutionError extends Error {
       previewExtractionStatus = null,
       previewExtractionError = null,
       previewExtractionCandidateCount = null,
-      previewExtractionSelectedMimeType = null
+      previewExtractionSelectedMimeType = null,
+      providerDiagnostics = null,
+      fallbackUsed = null,
+      bestImageUrl = null,
+      selectedImageUrl = null,
+      imageCount = null,
+      filteredImageCount = null,
+      telegramPreviewUsed = false
     } = {}
   ) {
     super(message);
@@ -52,6 +67,13 @@ export class InputResolutionError extends Error {
     this.previewExtractionError = previewExtractionError;
     this.previewExtractionCandidateCount = previewExtractionCandidateCount;
     this.previewExtractionSelectedMimeType = previewExtractionSelectedMimeType;
+    this.providerDiagnostics = providerDiagnostics;
+    this.fallbackUsed = fallbackUsed;
+    this.bestImageUrl = bestImageUrl;
+    this.selectedImageUrl = selectedImageUrl;
+    this.imageCount = imageCount;
+    this.filteredImageCount = filteredImageCount;
+    this.telegramPreviewUsed = telegramPreviewUsed;
   }
 }
 
@@ -98,6 +120,21 @@ function platformSourceType(source) {
   return PLATFORM_SOURCE_TYPES[source] || GENERIC_SOURCE_TYPE;
 }
 
+function providerDiagnosticsFromMetadata(metadata = {}) {
+  return metadata.providerDiagnostics || metadata.diagnostics?.providerDiagnostics || null;
+}
+
+function isProviderBlocked(metadata = {}) {
+  return providerDiagnosticsFromMetadata(metadata)?.blocked === true;
+}
+
+function metadataErrors(metadata = {}) {
+  return [
+    ...(Array.isArray(metadata.diagnostics?.errors) ? metadata.diagnostics.errors : []),
+    ...(Array.isArray(metadata.diagnostics?.warnings) ? metadata.diagnostics.warnings : [])
+  ].filter(Boolean);
+}
+
 function previewFields({
   url,
   sourceType = GENERIC_SOURCE_TYPE,
@@ -106,7 +143,9 @@ function previewFields({
   error = null,
   candidateCount = null,
   selectedImageUrl = null,
-  mimeType = null
+  mimeType = null,
+  providerDiagnostics = null,
+  fallbackUsed = null
 } = {}) {
   return {
     sourceType,
@@ -116,7 +155,9 @@ function previewFields({
     previewExtractionStatus: status,
     previewExtractionError: error,
     previewExtractionCandidateCount: Number.isFinite(candidateCount) ? candidateCount : null,
-    previewExtractionSelectedMimeType: mimeType || null
+    previewExtractionSelectedMimeType: mimeType || null,
+    providerDiagnostics,
+    fallbackUsed
   };
 }
 
@@ -124,11 +165,22 @@ function logPreviewExtraction(level, details = {}) {
   const payload = {
     url: details.url || null,
     domain: details.domain || sourceDomain(details.url) || null,
+    provider: details.provider || null,
+    status: details.status || null,
     extractorUsed: details.extractorUsed || details.method || null,
     imageCandidateCount: Number.isFinite(details.candidateCount) ? details.candidateCount : null,
-    selectedImageUrl: details.selectedImageUrl || null,
+    imageCount: Number.isFinite(details.imageCount) ? details.imageCount : Number.isFinite(details.candidateCount) ? details.candidateCount : null,
+    filteredImageCount: Number.isFinite(details.filteredImageCount) ? details.filteredImageCount : null,
+    bestImage: details.bestImage || null,
+    selectedImage: details.selectedImage || details.selectedImageUrl || null,
+    selectedImageUrl: details.selectedImageUrl || details.selectedImage || null,
+    fallbackUsed: details.fallbackUsed || null,
+    telegramPreviewUsed: Boolean(details.telegramPreviewUsed || details.fallbackUsed === "telegram_preview"),
+    trustedUser: typeof details.trustedUser === "boolean" ? details.trustedUser : null,
+    providerDiagnostics: details.providerDiagnostics || null,
     failureReason: details.failureReason || null,
-    sourceType: details.sourceType || null
+    sourceType: details.sourceType || null,
+    errorStack: details.errorStack || null
   };
 
   const logger = level === "error" || level === "warn" ? console.warn : console.info;
@@ -144,7 +196,9 @@ function inputError(message, options = {}) {
     error: options.previewExtractionError || message,
     candidateCount: options.previewExtractionCandidateCount,
     selectedImageUrl: options.extractedImageUrl,
-    mimeType: options.previewExtractionSelectedMimeType
+    mimeType: options.previewExtractionSelectedMimeType,
+    providerDiagnostics: options.providerDiagnostics,
+    fallbackUsed: options.fallbackUsed
   });
 
   return new InputResolutionError(message, {
@@ -155,11 +209,28 @@ function inputError(message, options = {}) {
   });
 }
 
+async function withTimeout(promise, timeoutMs, timeoutMessage) {
+  let timeout;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function getTelegramFileUrl(bot, fileId, source = "telegram_image") {
   let file;
 
   try {
-    file = await bot.getFile(fileId);
+    file = await withTimeout(
+      bot.getFile(fileId),
+      TELEGRAM_FILE_TIMEOUT_MS,
+      "Telegram file lookup timed out."
+    );
   } catch (error) {
     throw new InputResolutionError(`Could not download Telegram media: ${error.message}`, {
       status: "failed",
@@ -179,7 +250,7 @@ async function getTelegramFileUrl(bot, fileId, source = "telegram_image") {
   return `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
 }
 
-function isDirectImageUrl(url) {
+export function isDirectImageUrl(url) {
   return IMAGE_EXTENSION_PATTERN.test(url);
 }
 
@@ -325,53 +396,6 @@ async function safeFetchWithRedirects(url, options = {}, { timeoutMs = REQUEST_T
   throw new Error("Too many redirects while fetching URL.");
 }
 
-async function readLimitedText(response, maxBytes = MAX_HTML_BYTES) {
-  const contentLength = Number(response.headers.get("content-length"));
-
-  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    throw new Error(`HTML document is larger than ${maxBytes} bytes.`);
-  }
-
-  if (!response.body?.getReader) {
-    const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > maxBytes) {
-      throw new Error(`HTML document is larger than ${maxBytes} bytes.`);
-    }
-    return text;
-  }
-
-  const reader = response.body.getReader();
-  const chunks = [];
-  let total = 0;
-
-  while (true) {
-    const { done, value } = await reader.read();
-
-    if (done) {
-      break;
-    }
-
-    total += value.byteLength;
-
-    if (total > maxBytes) {
-      await reader.cancel().catch(() => {});
-      throw new Error(`HTML document is larger than ${maxBytes} bytes.`);
-    }
-
-    chunks.push(value);
-  }
-
-  const body = new Uint8Array(total);
-  let offset = 0;
-
-  chunks.forEach((chunk) => {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  });
-
-  return new TextDecoder("utf-8").decode(body);
-}
-
 function normalizedMimeType(response) {
   return String(response.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
 }
@@ -451,56 +475,6 @@ async function probeImageUrl(url) {
   throw lastError || new Error("Image URL could not be validated.");
 }
 
-async function fetchHtmlPage(url, { sourceType = GENERIC_SOURCE_TYPE, extractor = "generic:metadata" } = {}) {
-  try {
-    const { response, finalUrl } = await safeFetchWithRedirects(url, {
-      method: "GET",
-      headers: {
-        Accept: "text/html,application/xhtml+xml",
-        "User-Agent": BROWSER_USER_AGENT
-      }
-    });
-
-    if (!response.ok) {
-      await cancelBody(response);
-      throw new Error(`Page metadata request failed with status ${response.status}.`);
-    }
-
-    const contentType = normalizedMimeType(response);
-
-    if (contentType && !["text/html", "application/xhtml+xml"].includes(contentType)) {
-      await cancelBody(response);
-      throw new Error(`URL returned ${contentType}, not HTML.`);
-    }
-
-    return {
-      html: await readLimitedText(response),
-      finalUrl
-    };
-  } catch (error) {
-    logPreviewExtraction("warn", {
-      url,
-      sourceType,
-      extractorUsed: extractor,
-      candidateCount: 0,
-      failureReason: error.message
-    });
-
-    throw inputError("Could not fetch page metadata for this link.", {
-      status: "failed",
-      rejectionReason: /not allowed|localhost|private|internal|credentials|valid/i.test(error.message)
-        ? "invalid_url"
-        : "processing_error",
-      source: sourceType,
-      sourceType,
-      inputUrl: url,
-      previewExtractionMethod: extractor,
-      previewExtractionError: error.message,
-      previewExtractionCandidateCount: 0
-    });
-  }
-}
-
 function classifyHost(url) {
   const host = new URL(url).hostname.replace(/^www\./, "").toLowerCase();
 
@@ -508,7 +482,7 @@ function classifyHost(url) {
     return "reddit";
   }
 
-  if (host === "twitter.com" || host === "x.com" || host.endsWith(".twitter.com")) {
+  if (host === "twitter.com" || host === "x.com" || host.endsWith(".twitter.com") || host === "t.co") {
     return "twitter";
   }
 
@@ -519,309 +493,11 @@ function classifyHost(url) {
   return "direct_url";
 }
 
-function numericHint(value) {
-  const parsed = Number.parseInt(String(value || "").replace(/[^\d]/g, ""), 10);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function isLikelyTinyAsset(url, { width = null, height = null } = {}) {
-  const lower = url.toLowerCase();
-  const bothDimensionsKnown = Number.isFinite(width) && Number.isFinite(height);
-
-  if (bothDimensionsKnown && (width < 180 || height < 120)) {
-    return true;
-  }
-
-  if (Number.isFinite(width) && width < 180) {
-    return true;
-  }
-
-  if (Number.isFinite(height) && height < 120) {
-    return true;
-  }
-
-  return /favicon|apple-touch-icon|\/icon[-_.]|\bicon\b|sprite|logo|avatar|badge|emoji/.test(lower);
-}
-
-function parseLargestSrcsetUrl(value) {
-  const candidates = String(value || "")
-    .split(",")
-    .map((entry) => {
-      const [url, descriptor] = entry.trim().split(/\s+/);
-      const weight = descriptor?.endsWith("w")
-        ? Number.parseInt(descriptor, 10)
-        : descriptor?.endsWith("x")
-          ? Number.parseFloat(descriptor) * 1000
-          : 0;
-
-      return {
-        url,
-        weight: Number.isFinite(weight) ? weight : 0
-      };
-    })
-    .filter((entry) => entry.url);
-
-  return candidates.sort((a, b) => b.weight - a.weight)[0]?.url || null;
-}
-
-function addCandidate(candidates, rawUrl, baseUrl, method, priority, hints = {}) {
-  const value = String(rawUrl || "").trim();
-
-  if (!value || /^(?:data|blob|file|javascript):/i.test(value)) {
-    return;
-  }
-
-  let absoluteUrl;
-
-  try {
-    absoluteUrl = new URL(value, baseUrl).toString();
-  } catch {
-    return;
-  }
-
-  const parsed = new URL(absoluteUrl);
-
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    return;
-  }
-
-  const width = numericHint(hints.width);
-  const height = numericHint(hints.height);
-
-  if (method === "html_img" && isLikelyTinyAsset(absoluteUrl, { width, height })) {
-    return;
-  }
-
-  const areaBoost = Number.isFinite(width) && Number.isFinite(height) ? Math.min(20, (width * height) / 50_000) : 0;
-
-  candidates.push({
-    url: absoluteUrl,
-    method,
-    width,
-    height,
-    score: priority + areaBoost - (hints.index || 0) / 100
-  });
-}
-
-function addJsonLdImageCandidates(candidates, value, baseUrl, priority = 70, depth = 0) {
-  if (depth > 6 || value === null || value === undefined) {
-    return;
-  }
-
-  if (typeof value === "string") {
-    addCandidate(candidates, value, baseUrl, "json_ld_image", priority);
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    value.forEach((item) => addJsonLdImageCandidates(candidates, item, baseUrl, priority, depth + 1));
-    return;
-  }
-
-  if (typeof value !== "object") {
-    return;
-  }
-
-  if (value.url || value.contentUrl || value["@id"]) {
-    addCandidate(candidates, value.url || value.contentUrl || value["@id"], baseUrl, "json_ld_image", priority);
-  }
-
-  ["image", "thumbnail", "thumbnailUrl", "contentUrl"].forEach((key) => {
-    if (Object.prototype.hasOwnProperty.call(value, key)) {
-      addJsonLdImageCandidates(candidates, value[key], baseUrl, priority, depth + 1);
-    }
-  });
-
-  if (Array.isArray(value["@graph"])) {
-    addJsonLdImageCandidates(candidates, value["@graph"], baseUrl, priority - 5, depth + 1);
-  }
-}
-
-function extractImageCandidates(html, baseUrl, { includeHtmlImages = true } = {}) {
-  const $ = cheerio.load(html);
-  const candidates = [];
-  const metaMethods = new Map([
-    ["og:image", { method: "og:image", priority: 100 }],
-    ["og:image:secure_url", { method: "og:image:secure_url", priority: 100 }],
-    ["twitter:image", { method: "twitter:image", priority: 92 }],
-    ["twitter:image:src", { method: "twitter:image:src", priority: 92 }]
-  ]);
-
-  $("meta").each((_, element) => {
-    const key = String($(element).attr("property") || $(element).attr("name") || "").trim().toLowerCase();
-    const config = metaMethods.get(key);
-
-    if (config) {
-      addCandidate(candidates, $(element).attr("content"), baseUrl, config.method, config.priority);
-    }
-  });
-
-  $("link[rel]").each((_, element) => {
-    const rel = String($(element).attr("rel") || "").toLowerCase().split(/\s+/);
-
-    if (rel.includes("image_src")) {
-      addCandidate(candidates, $(element).attr("href"), baseUrl, "image_src", 84);
-    }
-  });
-
-  $('script[type*="ld+json"]').each((_, element) => {
-    const text = $(element).contents().text().trim();
-
-    if (!text) {
-      return;
-    }
-
-    try {
-      addJsonLdImageCandidates(candidates, JSON.parse(text), baseUrl);
-    } catch {
-      // Ignore malformed JSON-LD and continue with other metadata.
-    }
-  });
-
-  if (includeHtmlImages) {
-    $("img").slice(0, 80).each((index, element) => {
-      const width = $(element).attr("width") || $(element).attr("data-width");
-      const height = $(element).attr("height") || $(element).attr("data-height");
-      const hints = {
-        width,
-        height,
-        index
-      };
-
-      [
-        parseLargestSrcsetUrl($(element).attr("srcset")),
-        parseLargestSrcsetUrl($(element).attr("data-srcset")),
-        $(element).attr("data-full-url"),
-        $(element).attr("data-original"),
-        $(element).attr("data-lazy-src"),
-        $(element).attr("data-src"),
-        $(element).attr("src")
-      ].forEach((value) => addCandidate(candidates, value, baseUrl, "html_img", 35, hints));
-    });
-  }
-
-  const seen = new Set();
-
-  return candidates
-    .filter((candidate) => {
-      if (seen.has(candidate.url)) {
-        return false;
-      }
-
-      seen.add(candidate.url);
-      return true;
-    })
-    .sort((a, b) => b.score - a.score);
-}
-
-async function selectUsableImage(url, candidates, { sourceType, extractor }) {
-  const candidateCount = candidates.length;
-  let lastFailure = "No image candidates were found.";
-
-  for (const candidate of candidates.slice(0, 24)) {
-    try {
-      const validation = await probeImageUrl(candidate.url);
-      const result = {
-        imageUrl: validation.url,
-        method: candidate.method,
-        extractor,
-        sourceType,
-        candidateCount,
-        mimeType: validation.mimeType
-      };
-
-      logPreviewExtraction("info", {
-        url,
-        sourceType,
-        extractorUsed: `${extractor}:${candidate.method}`,
-        candidateCount,
-        selectedImageUrl: validation.url
-      });
-
-      return result;
-    } catch (error) {
-      lastFailure = error.message || String(error);
-    }
-  }
-
-  logPreviewExtraction("warn", {
-    url,
-    sourceType,
-    extractorUsed: extractor,
-    candidateCount,
-    failureReason: lastFailure
-  });
-
-  throw inputError("Could not find a usable image preview on this page.", {
-    rejectionReason: "invalid_media",
-    source: sourceType,
-    sourceType,
-    inputUrl: url,
-    previewExtractionMethod: extractor,
-    previewExtractionError: lastFailure,
-    previewExtractionCandidateCount: candidateCount
-  });
-}
-
-async function resolvePreviewFromPage(url, page, { sourceType, extractor, includeHtmlImages }) {
-  const candidates = extractImageCandidates(page.html, page.finalUrl, {
-    includeHtmlImages
-  });
-
-  return selectUsableImage(url, candidates, {
-    sourceType,
-    extractor
-  });
-}
-
-async function resolvePlatformPreview(url, source) {
-  const sourceType = platformSourceType(source);
-  const page = await fetchHtmlPage(url, {
-    sourceType,
-    extractor: `${source}:metadata`
-  });
-
-  try {
-    return await resolvePreviewFromPage(url, page, {
-      sourceType,
-      extractor: `${source}:metadata`,
-      includeHtmlImages: false
-    });
-  } catch (error) {
-    logPreviewExtraction("warn", {
-      url,
-      sourceType,
-      extractorUsed: `${source}:metadata`,
-      candidateCount: Number.isFinite(error.previewExtractionCandidateCount) ? error.previewExtractionCandidateCount : 0,
-      failureReason: error.previewExtractionError || error.message
-    });
-  }
-
-  return resolvePreviewFromPage(url, page, {
-    sourceType,
-    extractor: `${source}:generic_fallback`,
-    includeHtmlImages: true
-  });
-}
-
-async function resolveGenericPreview(url) {
-  const page = await fetchHtmlPage(url, {
-    sourceType: GENERIC_SOURCE_TYPE,
-    extractor: "generic:metadata"
-  });
-
-  return resolvePreviewFromPage(url, page, {
-    sourceType: GENERIC_SOURCE_TYPE,
-    extractor: "generic:metadata",
-    includeHtmlImages: true
-  });
-}
-
 function ensureSocialEnabled(source, settings, url) {
   const sourceType = platformSourceType(source);
 
   if (source === "reddit" && !settings.enableReddit) {
-    throw inputError("Reddit links are disabled by the current settings.", {
+    throw inputError("This feature is not available right now.", {
       rejectionReason: "unsupported_source",
       source: sourceType,
       sourceType,
@@ -833,7 +509,7 @@ function ensureSocialEnabled(source, settings, url) {
   }
 
   if (source === "twitter" && !settings.enableTwitter) {
-    throw inputError("Twitter/X links are disabled by the current settings.", {
+    throw inputError("This feature is not available right now.", {
       rejectionReason: "unsupported_source",
       source: sourceType,
       sourceType,
@@ -845,7 +521,7 @@ function ensureSocialEnabled(source, settings, url) {
   }
 
   if (source === "facebook" && !settings.enableFacebook) {
-    throw inputError("Facebook links are disabled by the current settings.", {
+    throw inputError("This feature is not available right now.", {
       rejectionReason: "unsupported_source",
       source: sourceType,
       sourceType,
@@ -859,7 +535,7 @@ function ensureSocialEnabled(source, settings, url) {
 
 function ensureGenericLinksEnabled(settings, url) {
   if (settings.enableGenericLinks === false) {
-    throw inputError("Generic website links are disabled by the current settings.", {
+    throw inputError("This feature is not available right now.", {
       rejectionReason: "unsupported_source",
       source: GENERIC_SOURCE_TYPE,
       sourceType: GENERIC_SOURCE_TYPE,
@@ -871,7 +547,128 @@ function ensureGenericLinksEnabled(settings, url) {
   }
 }
 
-function urlInputPayload({ url, imageUrl, sourceType, method, candidateCount, mimeType }) {
+function resolveLinkSource(url, settings) {
+  let source;
+
+  try {
+    source = classifyHost(url);
+  } catch {
+    throw inputError("That URL is not valid.", {
+      rejectionReason: "invalid_url",
+      source: "url",
+      sourceType: GENERIC_SOURCE_TYPE,
+      inputUrl: url,
+      previewExtractionMethod: "url_validation",
+      previewExtractionError: "invalid_url",
+      previewExtractionCandidateCount: 0
+    });
+  }
+
+  if (source !== "direct_url") {
+    ensureSocialEnabled(source, settings, url);
+    return {
+      source,
+      sourceType: platformSourceType(source)
+    };
+  }
+
+  ensureGenericLinksEnabled(settings, url);
+  return {
+    source,
+    sourceType: GENERIC_SOURCE_TYPE
+  };
+}
+
+function metanovaFetchOptions() {
+  return {
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    retries: 1,
+    retryDelayMs: 250,
+    maxRedirects: MAX_REDIRECTS,
+    maxBytes: MAX_METADATA_BYTES,
+    userAgent: BROWSER_USER_AGENT,
+    acceptLanguage: "en-US,en;q=0.9",
+    fetchOEmbed: true
+  };
+}
+
+async function fetchMetaNovaMetadata(url, { sourceType, trustedUser = false } = {}) {
+  let metadata;
+
+  try {
+    metadata = await fetchMetadata(url, metanovaFetchOptions());
+  } catch (error) {
+    logPreviewExtraction("warn", {
+      url,
+      sourceType,
+      extractorUsed: METANOVA_METHOD,
+      candidateCount: 0,
+      status: "failed",
+      trustedUser,
+      failureReason: error.message,
+      errorStack: error.stack
+    });
+
+    throw inputError("I could not open this link. Try another link or send the image directly.", {
+      status: "failed",
+      rejectionReason: /not allowed|localhost|private|internal|credentials|valid|protocol/i.test(error.message)
+        ? "invalid_url"
+        : "metadata_fetch_error",
+      source: sourceType,
+      sourceType,
+      inputUrl: url,
+      previewExtractionMethod: METANOVA_METHOD,
+      previewExtractionError: error.message,
+      previewExtractionCandidateCount: 0
+    });
+  }
+
+  const providerDiagnostics = providerDiagnosticsFromMetadata(metadata);
+  const blocked = isProviderBlocked(metadata);
+  const candidateCount = Array.isArray(metadata.images) ? metadata.images.length : 0;
+  const rankedImages = filterAndRankDiscoveredImages(metadata);
+  const selectedAnalysisImage = selectAnalysisImage(metadata);
+  const failureReason = !metadata.ok
+    ? metadataErrors(metadata).join("; ") || "metanova_not_ok"
+    : blocked
+      ? providerDiagnostics?.reason || "provider_blocked"
+      : selectedAnalysisImage
+        ? null
+        : "no_usable_image";
+
+  logPreviewExtraction(failureReason ? "warn" : "info", {
+    url,
+    sourceType,
+    extractorUsed: METANOVA_METHOD,
+    candidateCount,
+    imageCount: candidateCount,
+    filteredImageCount: rankedImages.length,
+    bestImage: metadata.bestImage || null,
+    selectedImage: selectedAnalysisImage?.url || null,
+    selectedImageUrl: selectedAnalysisImage?.url || metadata.bestImage || null,
+    provider: providerDiagnostics?.platform || metadata.diagnostics?.adapterUsed || metadata.diagnostics?.adapter?.name || metadata.siteName || null,
+    status: metadata.ok ? "success" : "failed",
+    trustedUser,
+    providerDiagnostics,
+    failureReason
+  });
+
+  return metadata;
+}
+
+function urlInputPayload({
+  url,
+  imageUrl,
+  sourceType,
+  method,
+  candidateCount,
+  mimeType,
+  providerDiagnostics = null,
+  fallbackUsed = null,
+  bestImageUrl = null,
+  filteredImageCount = null,
+  telegramPreviewUsed = false
+}) {
   return {
     source: sourceType,
     sourceType,
@@ -884,12 +681,20 @@ function urlInputPayload({ url, imageUrl, sourceType, method, candidateCount, mi
     previewExtractionError: null,
     previewExtractionCandidateCount: Number.isFinite(candidateCount) ? candidateCount : null,
     previewExtractionSelectedMimeType: mimeType || null,
+    provider: providerDiagnostics?.platform || null,
+    bestImageUrl: bestImageUrl || null,
+    selectedImageUrl: imageUrl,
+    imageCount: Number.isFinite(candidateCount) ? candidateCount : null,
+    filteredImageCount: Number.isFinite(filteredImageCount) ? filteredImageCount : null,
+    telegramPreviewUsed: Boolean(telegramPreviewUsed || fallbackUsed === "telegram_preview"),
     inputFileId: null,
     inputTelegramFileUrl: null,
     inputImageUrl: imageUrl,
     inputThumbnail: imageUrl,
     inputPreview: imageUrl,
-    imageUrl
+    imageUrl,
+    providerDiagnostics,
+    fallbackUsed
   };
 }
 
@@ -902,7 +707,8 @@ async function resolveDirectImageInput(url) {
       sourceType: DIRECT_IMAGE_SOURCE_TYPE,
       extractorUsed: "direct:image_url",
       candidateCount: 1,
-      selectedImageUrl: validation.url
+      selectedImageUrl: validation.url,
+      status: "success"
     });
 
     return urlInputPayload({
@@ -926,6 +732,533 @@ async function resolveDirectImageInput(url) {
       previewExtractionCandidateCount: 1
     });
   }
+}
+
+function photoCandidates(value) {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (Array.isArray(value.sizes)) {
+    return value.sizes;
+  }
+
+  return [value];
+}
+
+function largestTelegramPhoto(value) {
+  return photoCandidates(value)
+    .filter((photo) => photo?.file_id)
+    .sort((a, b) => Number(b.width || 0) * Number(b.height || 0) - Number(a.width || 0) * Number(a.height || 0))[0] || null;
+}
+
+function telegramPreviewFileId(message = {}) {
+  const page = message.web_page || message.webPage || null;
+
+  if (!page || typeof page !== "object") {
+    return null;
+  }
+
+  const photo = largestTelegramPhoto(page.photo || page.thumbnail);
+  if (photo?.file_id) {
+    return photo.file_id;
+  }
+
+  const nestedThumbnail = [
+    page.animation?.thumbnail,
+    page.video?.thumbnail,
+    page.document?.thumbnail,
+    page.audio?.thumbnail
+  ].map(largestTelegramPhoto).find(Boolean);
+
+  if (nestedThumbnail?.file_id) {
+    return nestedThumbnail.file_id;
+  }
+
+  if (page.document?.mime_type?.startsWith("image/") && page.document.file_id) {
+    return page.document.file_id;
+  }
+
+  return null;
+}
+
+async function resolveTelegramPreviewFallback(message, bot, url, {
+  metadata = null,
+  sourceType = TELEGRAM_PREVIEW_SOURCE_TYPE,
+  trustedUser = false,
+  reason = "fallback"
+} = {}) {
+  const fileId = telegramPreviewFileId(message);
+
+  if (!fileId) {
+    return null;
+  }
+
+  try {
+    const imageUrl = await getTelegramFileUrl(bot, fileId, TELEGRAM_PREVIEW_SOURCE_TYPE);
+    const providerDiagnostics = providerDiagnosticsFromMetadata(metadata);
+
+    logPreviewExtraction("info", {
+      url,
+      sourceType: TELEGRAM_PREVIEW_SOURCE_TYPE,
+      extractorUsed: TELEGRAM_PREVIEW_METHOD,
+      candidateCount: 1,
+      selectedImageUrl: imageUrl,
+      fallbackUsed: "telegram_preview",
+      telegramPreviewUsed: true,
+      trustedUser,
+      providerDiagnostics,
+      status: "success"
+    });
+
+    return urlInputPayload({
+      url,
+      imageUrl,
+      sourceType: TELEGRAM_PREVIEW_SOURCE_TYPE,
+      method: `${TELEGRAM_PREVIEW_METHOD}:${reason}`,
+      candidateCount: 1,
+      mimeType: "image/telegram-preview",
+      providerDiagnostics,
+      fallbackUsed: "telegram_preview",
+      bestImageUrl: metadata?.bestImage || null,
+      filteredImageCount: filterAndRankDiscoveredImages(metadata || {}).length,
+      telegramPreviewUsed: true
+    });
+  } catch (error) {
+    logPreviewExtraction("warn", {
+      url,
+      sourceType,
+      extractorUsed: TELEGRAM_PREVIEW_METHOD,
+      candidateCount: 1,
+      fallbackUsed: "telegram_preview",
+      trustedUser,
+      failureReason: error.message,
+      errorStack: error.stack
+    });
+    return null;
+  }
+}
+
+function metadataUnavailableError(url, metadata, sourceType) {
+  const providerDiagnostics = providerDiagnosticsFromMetadata(metadata);
+  const blocked = isProviderBlocked(metadata);
+  const errors = metadataErrors(metadata);
+  const reason = blocked
+    ? "provider_blocked"
+    : metadata?.ok === false
+      ? (/not allowed|localhost|private|internal|credentials|valid|protocol/i.test(errors.join(" "))
+        ? "invalid_url"
+        : "metadata_fetch_error")
+      : "invalid_media";
+  const message = blocked
+    ? "I could not extract a suitable image from this link. If Telegram shows a preview image, I will try to use it. Otherwise, send the image directly."
+    : metadata?.ok === false
+      ? "I could not open this link. Try another link or send the image directly."
+      : "I could not find a suitable image inside this link. Send the image directly and I will analyze it.";
+
+  return inputError(message, {
+    status: "failed",
+    rejectionReason: reason,
+    source: sourceType,
+    sourceType,
+    inputUrl: url,
+    previewExtractionMethod: METANOVA_METHOD,
+    previewExtractionError: errors.join("; ") || providerDiagnostics?.reason || message,
+    previewExtractionCandidateCount: Array.isArray(metadata?.images) ? metadata.images.length : 0,
+    providerDiagnostics
+  });
+}
+
+async function buildInputFromMetadataImage({
+  url,
+  imageUrl,
+  sourceType,
+  metadata,
+  method,
+  candidateCount,
+  fallbackUsed = null,
+  filteredImageCount = null,
+  bestImageUrl = null
+}) {
+  const providerDiagnostics = providerDiagnosticsFromMetadata(metadata);
+  const resolvedBestImageUrl = bestImageUrl || metadata?.bestImage || null;
+  const resolvedFilteredImageCount = Number.isFinite(filteredImageCount)
+    ? filteredImageCount
+    : filterAndRankDiscoveredImages(metadata || {}).length;
+
+  try {
+    const validation = await probeImageUrl(imageUrl);
+
+    logPreviewExtraction("info", {
+      url,
+      sourceType,
+      extractorUsed: method,
+      candidateCount,
+      imageCount: candidateCount,
+      filteredImageCount: resolvedFilteredImageCount,
+      bestImage: resolvedBestImageUrl,
+      selectedImage: validation.url,
+      selectedImageUrl: validation.url,
+      fallbackUsed,
+      providerDiagnostics,
+      status: "success"
+    });
+
+    return urlInputPayload({
+      url,
+      imageUrl: validation.url,
+      sourceType,
+      method,
+      candidateCount,
+      mimeType: validation.mimeType,
+      providerDiagnostics,
+      fallbackUsed,
+      bestImageUrl: resolvedBestImageUrl,
+      filteredImageCount: resolvedFilteredImageCount
+    });
+  } catch (error) {
+    throw inputError("I found an image in that link, but could not load it safely. Send the image directly or try another link.", {
+      status: "failed",
+      rejectionReason: /not allowed|localhost|private|internal|credentials|valid/i.test(error.message)
+        ? "invalid_url"
+        : "invalid_media",
+      source: sourceType,
+      sourceType,
+      inputUrl: url,
+      extractedImageUrl: imageUrl,
+      previewExtractionMethod: method,
+      previewExtractionError: error.message,
+      previewExtractionCandidateCount: candidateCount,
+      providerDiagnostics,
+      bestImageUrl: resolvedBestImageUrl,
+      selectedImageUrl: imageUrl,
+      imageCount: candidateCount,
+      filteredImageCount: resolvedFilteredImageCount,
+      fallbackUsed
+    });
+  }
+}
+
+async function resolveMetadataBestInput(url, message, bot, settings, { trustedUser = false } = {}) {
+  const { sourceType } = resolveLinkSource(url, settings);
+  const metadata = await fetchMetaNovaMetadata(url, { sourceType, trustedUser });
+  const selectedImage = selectAnalysisImage(metadata);
+  const imageCount = Array.isArray(metadata.images) ? metadata.images.length : 0;
+  const filteredImageCount = filterAndRankDiscoveredImages(metadata).length;
+  const needsFallback = metadata.ok === false || isProviderBlocked(metadata) || !selectedImage;
+
+  if (needsFallback) {
+    const fallback = await resolveTelegramPreviewFallback(message, bot, url, {
+      metadata,
+      sourceType,
+      trustedUser,
+      reason: isProviderBlocked(metadata) ? "provider_blocked" : "metadata_failed"
+    });
+
+    if (fallback) {
+      return fallback;
+    }
+
+    throw metadataUnavailableError(url, metadata, sourceType);
+  }
+
+  try {
+    return await buildInputFromMetadataImage({
+      url,
+      imageUrl: selectedImage.url,
+      sourceType,
+      metadata,
+      method: selectedImage.isBestImage ? METANOVA_BEST_IMAGE_METHOD : "metanova:vettedImage",
+      candidateCount: imageCount || 1,
+      filteredImageCount,
+      bestImageUrl: metadata.bestImage || null
+    });
+  } catch (error) {
+    const fallback = await resolveTelegramPreviewFallback(message, bot, url, {
+      metadata,
+      sourceType,
+      trustedUser,
+      reason: "image_probe_failed"
+    });
+
+    if (fallback) {
+      return fallback;
+    }
+
+    throw error;
+  }
+}
+
+function numericDimension(value) {
+  const numberValue = typeof value === "number" ? value : Number.parseInt(String(value || ""), 10);
+  return Number.isFinite(numberValue) && numberValue > 0 ? numberValue : null;
+}
+
+function normalizeImageAsset(image, { isBestImage = false } = {}) {
+  if (typeof image === "string") {
+    return {
+      url: image,
+      width: null,
+      height: null,
+      source: "bestImage",
+      score: null,
+      confidence: null,
+      title: null,
+      alt: null,
+      isBestImage
+    };
+  }
+
+  if (!image || typeof image !== "object") {
+    return null;
+  }
+
+  const url = image.url || image.secureUrl;
+
+  if (!url) {
+    return null;
+  }
+
+  return {
+    url,
+    width: numericDimension(image.width),
+    height: numericDimension(image.height),
+    source: image.source || image.metadata?.source || image.metadata?.discoveredFrom || "metadata",
+    score: Number.isFinite(Number(image.score)) ? Number(image.score) : null,
+    confidence: Number.isFinite(Number(image.confidence)) ? Number(image.confidence) : null,
+    title: image.title || null,
+    alt: image.alt || null,
+    isBestImage
+  };
+}
+
+function normalizedImageKey(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = "";
+    return parsed.toString().toLowerCase();
+  } catch {
+    return String(url || "").toLowerCase();
+  }
+}
+
+function imageArea(image) {
+  return Number.isFinite(image.width) && Number.isFinite(image.height) ? image.width * image.height : 0;
+}
+
+function imageQualityScore(image) {
+  if (Number.isFinite(image.score)) {
+    return image.score;
+  }
+
+  if (Number.isFinite(image.confidence)) {
+    return image.confidence;
+  }
+
+  return 0;
+}
+
+function mergeImageAssets(current, next) {
+  const currentArea = imageArea(current);
+  const nextArea = imageArea(next);
+  const preferNext = nextArea > currentArea || (nextArea === currentArea && imageQualityScore(next) > imageQualityScore(current));
+  const base = preferNext ? next : current;
+  const fallback = preferNext ? current : next;
+
+  return {
+    ...base,
+    width: base.width ?? fallback.width,
+    height: base.height ?? fallback.height,
+    source: base.source || fallback.source,
+    score: base.score ?? fallback.score,
+    confidence: base.confidence ?? fallback.confidence,
+    title: base.title || fallback.title,
+    alt: base.alt || fallback.alt,
+    isBestImage: Boolean(current.isBestImage || next.isBestImage)
+  };
+}
+
+function isPublicImageUrl(image) {
+  if (!image?.url) {
+    return false;
+  }
+
+  return /^https?:\/\//i.test(image.url);
+}
+
+function imageSearchText(image = {}) {
+  return [
+    image.url,
+    image.source,
+    image.title,
+    image.alt
+  ].filter(Boolean).join(" ");
+}
+
+function isWeakImage(image) {
+  return WEAK_IMAGE_TEXT_PATTERN.test(imageSearchText(image).toLowerCase());
+}
+
+function hasTinyKnownDimensions(image) {
+  return (Number.isFinite(image.width) && image.width < 200) || (Number.isFinite(image.height) && image.height < 200);
+}
+
+function isUsefulImage(image, { allowTiny = false } = {}) {
+  return isPublicImageUrl(image) && !isWeakImage(image) && (allowTiny || !hasTinyKnownDimensions(image));
+}
+
+function compareImagesByAreaThenQuality(left, right) {
+  return imageArea(right) - imageArea(left) || imageQualityScore(right) - imageQualityScore(left);
+}
+
+function normalizedImageCandidates(metadata = {}) {
+  const candidatesByUrl = new Map();
+  const rawImages = Array.isArray(metadata.images) ? metadata.images : [];
+  const inputs = [
+    ...rawImages.map((image) => ({ image, isBestImage: false })),
+    ...(metadata.bestImage ? [{ image: metadata.bestImage, isBestImage: true }] : [])
+  ];
+
+  inputs.forEach(({ image, isBestImage }) => {
+    const normalized = normalizeImageAsset(image, { isBestImage });
+
+    if (!normalized || !isPublicImageUrl(normalized)) {
+      return;
+    }
+
+    const key = normalizedImageKey(normalized.url);
+    const current = candidatesByUrl.get(key);
+    candidatesByUrl.set(key, current ? mergeImageAssets(current, normalized) : normalized);
+  });
+
+  return [...candidatesByUrl.values()];
+}
+
+export function resolveMaxDiscoveredImages(settings = {}) {
+  const value = Number(settings.maxDiscoveredImages);
+
+  if (!Number.isFinite(value)) {
+    return DEFAULT_MAX_DISCOVERED_IMAGES;
+  }
+
+  return Math.min(MAX_DISCOVERED_IMAGES_LIMIT, Math.max(1, Math.floor(value)));
+}
+
+export function filterAndRankDiscoveredImages(metadata = {}) {
+  const candidates = normalizedImageCandidates(metadata).filter((image) => !isWeakImage(image));
+  const usefulImages = candidates.filter((image) => isUsefulImage(image));
+  const displayImages = usefulImages.length ? usefulImages : candidates.filter((image) => isUsefulImage(image, { allowTiny: true }));
+
+  return displayImages.sort(compareImagesByAreaThenQuality);
+}
+
+export function selectAnalysisImage(metadata = {}) {
+  const candidates = normalizedImageCandidates(metadata);
+  const metaNovaBest = candidates.find((image) => image.isBestImage);
+
+  if (metaNovaBest && isUsefulImage(metaNovaBest)) {
+    return metaNovaBest;
+  }
+
+  return filterAndRankDiscoveredImages(metadata)[0] || null;
+}
+
+function hasDirectTelegramImage(message = {}) {
+  return Boolean(getLargestPhoto(message) || (message.document?.mime_type?.startsWith("image/") && message.document.file_id));
+}
+
+export function shouldOfferTrustedLinkSelection(message = {}) {
+  const [url] = extractUrls(message);
+  return Boolean(url && !hasDirectTelegramImage(message) && !isDirectImageUrl(url));
+}
+
+export async function resolveTrustedLinkSelection(message, bot, settings, { trustedUser = false } = {}) {
+  const [url] = extractUrls(message);
+
+  if (!url || !shouldOfferTrustedLinkSelection(message)) {
+    return null;
+  }
+
+  const { source, sourceType } = resolveLinkSource(url, settings);
+  const metadata = await fetchMetaNovaMetadata(url, { sourceType, trustedUser });
+  const selectedImage = selectAnalysisImage(metadata);
+  const imageCount = Array.isArray(metadata.images) ? metadata.images.length : 0;
+  const filteredImageCount = filterAndRankDiscoveredImages(metadata).length;
+  const needsFallback = metadata.ok === false || isProviderBlocked(metadata) || !selectedImage;
+
+  if (needsFallback) {
+    const fallback = await resolveTelegramPreviewFallback(message, bot, url, {
+      metadata,
+      sourceType,
+      trustedUser,
+      reason: isProviderBlocked(metadata) ? "provider_blocked" : "metadata_failed"
+    });
+
+    if (fallback) {
+      return {
+        type: "input",
+        input: fallback
+      };
+    }
+
+    throw metadataUnavailableError(url, metadata, sourceType);
+  }
+
+  let bestInput;
+
+  try {
+    bestInput = await buildInputFromMetadataImage({
+      url,
+      imageUrl: selectedImage.url,
+      sourceType,
+      metadata,
+      method: selectedImage.isBestImage ? METANOVA_BEST_IMAGE_METHOD : "metanova:vettedImage",
+      candidateCount: imageCount || 1,
+      filteredImageCount,
+      bestImageUrl: metadata.bestImage || null
+    });
+  } catch (error) {
+    const fallback = await resolveTelegramPreviewFallback(message, bot, url, {
+      metadata,
+      sourceType,
+      trustedUser,
+      reason: "image_probe_failed"
+    });
+
+    if (fallback) {
+      return {
+        type: "input",
+        input: fallback
+      };
+    }
+
+    throw error;
+  }
+
+  return {
+    type: "selection",
+    url,
+    source,
+    sourceType,
+    metadata,
+    bestInput,
+    images: filterAndRankDiscoveredImages(metadata)
+  };
+}
+
+export async function resolveDiscoveredImageInput({ url, sourceType, metadata, image, candidateCount }) {
+  return buildInputFromMetadataImage({
+    url,
+    imageUrl: image.url,
+    sourceType,
+    metadata,
+    method: `metanova:selectedImage:${image.source || "image"}`,
+    candidateCount
+  });
 }
 
 export function extractUrls(message) {
@@ -975,6 +1308,10 @@ export async function resolveImageInput(message, bot, settings) {
     return null;
   }
 
+  if (isDirectImageUrl(url)) {
+    return resolveDirectImageInput(url);
+  }
+
   let source;
 
   try {
@@ -991,42 +1328,15 @@ export async function resolveImageInput(message, bot, settings) {
     });
   }
 
-  if (isDirectImageUrl(url)) {
-    return resolveDirectImageInput(url);
-  }
-
-  if (source !== "direct_url") {
-    ensureSocialEnabled(source, settings, url);
-    const preview = await resolvePlatformPreview(url, source);
-
-    return urlInputPayload({
-      url,
-      imageUrl: preview.imageUrl,
-      sourceType: preview.sourceType,
-      method: `${preview.extractor}:${preview.method}`,
-      candidateCount: preview.candidateCount,
-      mimeType: preview.mimeType
-    });
-  }
-
-  try {
-    return await resolveDirectImageInput(url);
-  } catch (error) {
-    if (error instanceof InputResolutionError && error.rejectionReason === "invalid_url") {
-      throw error;
+  if (source === "direct_url") {
+    try {
+      return await resolveDirectImageInput(url);
+    } catch (error) {
+      if (error instanceof InputResolutionError && error.rejectionReason === "invalid_url") {
+        throw error;
+      }
     }
   }
 
-  ensureGenericLinksEnabled(settings, url);
-
-  const preview = await resolveGenericPreview(url);
-
-  return urlInputPayload({
-    url,
-    imageUrl: preview.imageUrl,
-    sourceType: preview.sourceType,
-    method: `${preview.extractor}:${preview.method}`,
-    candidateCount: preview.candidateCount,
-    mimeType: preview.mimeType
-  });
+  return resolveMetadataBestInput(url, message, bot, settings);
 }

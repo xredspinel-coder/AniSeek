@@ -30,6 +30,10 @@ function normalizeSettings(raw = {}) {
       min: 0,
       max: 100
     }),
+    maxDiscoveredImages: Math.floor(asNumber(raw.maxDiscoveredImages, defaultSettings.maxDiscoveredImages, {
+      min: 1,
+      max: 20
+    })),
     enableTwitter: asBoolean(raw.enableTwitter, defaultSettings.enableTwitter),
     enableReddit: asBoolean(raw.enableReddit, defaultSettings.enableReddit),
     enableFacebook: asBoolean(raw.enableFacebook, defaultSettings.enableFacebook),

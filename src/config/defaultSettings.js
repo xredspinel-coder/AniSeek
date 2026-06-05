@@ -1,6 +1,7 @@
 export const defaultSettings = {
   dailyLimit: 5,
   similarityThreshold: 80,
+  maxDiscoveredImages: 5,
   enableTwitter: true,
   enableReddit: true,
   enableFacebook: false,

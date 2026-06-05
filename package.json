@@ -5,15 +5,17 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
+    "build": "node --check src/index.js && node --check src/bot.js && node --check src/services/linkExtractorService.js",
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "set:webhook": "node scripts/setWebhook.js"
+    "set:webhook": "node scripts/setWebhook.js",
+    "test": "node --test"
   },
   "dependencies": {
-    "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "firebase-admin": "^13.0.2",
+    "metanova": "^0.2.2",
     "node-telegram-bot-api": "^0.66.0"
   },
   "engines": {
