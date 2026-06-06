@@ -5,7 +5,7 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "build": "node --check src/index.js && node --check src/bot.js && node --check src/services/linkExtractorService.js && node --check src/services/imageSelectionService.js && node --check src/services/telegramMessageService.js",
+    "build": "node --check src/index.js && node --check src/bot.js && node --check src/services/activitySchema.js && node --check src/services/linkExtractorService.js && node --check src/services/imageSelectionService.js && node --check src/services/telegramMessageService.js",
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
     "set:webhook": "node scripts/setWebhook.js",

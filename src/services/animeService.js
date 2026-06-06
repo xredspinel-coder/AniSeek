@@ -112,6 +112,11 @@ export async function searchAnimeScene(imageUrl) {
       : null,
     similarity,
     videoUrl: best.video || null,
-    imageUrl: best.image || null
+    imageUrl: best.image || null,
+    traceMoe: {
+      imageUrl: best.image || null,
+      videoUrl: best.video || null,
+      raw: best
+    }
   };
 }

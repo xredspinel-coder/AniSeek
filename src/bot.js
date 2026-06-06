@@ -32,7 +32,7 @@ import {
   parseImageSelectionCallbackData,
   selectedImageConfirmationKeyboard
 } from "./services/imageSelectionService.js";
-import { withTemporaryMessage } from "./services/telegramMessageService.js";
+import { analysisProgressMessageText, withTemporaryMessage } from "./services/telegramMessageService.js";
 
 const token = process.env.BOT_TOKEN;
 
@@ -124,6 +124,7 @@ function storeImageSelection(message, user, selection) {
     metadata: selection.metadata,
     bestInput: selection.bestInput,
     images: selection.images,
+    selectedTelegramFileIds: {},
     createdAt: Date.now()
   });
 
@@ -249,10 +250,10 @@ async function sendSelectedImagePreview(chatId, selectionId, imageIndex, selecte
   };
 
   try {
-    await bot.sendPhoto(chatId, selectedImage.url, options);
+    return await bot.sendPhoto(chatId, selectedImage.url, options);
   } catch (error) {
     console.warn("Could not send selected image preview.", error.message);
-    await bot.sendMessage(chatId, options.caption, {
+    return bot.sendMessage(chatId, options.caption, {
       reply_markup: options.reply_markup
     });
   }
@@ -469,19 +470,36 @@ function buildSuccessResponse(match) {
 
 function buildActivityMedia(input = {}, result = {}, sentMedia = {}) {
   const inputTelegramFileId = input.inputTelegramFileId || input.inputFileId || null;
+  const selectedTelegramFileId = input.selectedTelegramFileId || null;
+  const dashboardImageFileId = input.dashboardImageFileId ||
+    selectedTelegramFileId ||
+    inputTelegramFileId ||
+    sentMedia.sentPhotoFileId ||
+    null;
+  const dashboardImageUrl = dashboardImageFileId
+    ? null
+    : input.dashboardImageUrl ||
+      input.selectedTelegramFileUrl ||
+      input.inputTelegramFileUrl ||
+      input.inputPreview ||
+      input.inputThumbnail ||
+      input.selectedImageUrl ||
+      input.extractedImageUrl ||
+      null;
+  const dashboardVideoFileId = sentMedia.sentVideoFileId || sentMedia.sentAnimationFileId || null;
 
   return {
     inputTelegramFileId,
+    inputTelegramFileUrl: inputTelegramFileId ? null : input.inputTelegramFileUrl || null,
+    selectedTelegramFileId,
+    selectedTelegramFileUrl: selectedTelegramFileId ? null : input.selectedTelegramFileUrl || null,
     sentPhotoFileId: sentMedia.sentPhotoFileId || null,
     sentVideoFileId: sentMedia.sentVideoFileId || null,
     sentAnimationFileId: sentMedia.sentAnimationFileId || null,
-    inputImageUrl: inputTelegramFileId ? null : input.inputImageUrl || input.inputPreview || input.inputThumbnail || null,
-    extractedImageUrl: input.extractedImageUrl || null,
-    inputTelegramFileUrl: input.inputTelegramFileUrl || null,
-    resultImageUrl: result.imageUrl || result.resultImageUrl || null,
-    resultVideoUrl: result.videoUrl || result.resultVideoUrl || null,
-    botVideoUrl: sentMedia.botVideoUrl || null,
-    botImageUrl: sentMedia.botImageUrl || null
+    dashboardImageFileId,
+    dashboardImageUrl,
+    dashboardVideoFileId,
+    dashboardVideoUrl: dashboardVideoFileId ? null : sentMedia.botVideoUrl || null
   };
 }
 
@@ -509,16 +527,7 @@ function previewExtractionSnapshot(input = {}) {
 }
 
 function progressMessageText(input = {}) {
-  if (
-    input.previewExtractionStatus === "success" &&
-    input.extractedImageUrl &&
-    input.sourceType &&
-    input.sourceType !== "direct_image_url"
-  ) {
-    return "Found a preview image from this link. Analyzing...";
-  }
-
-  return "Searching the scene...";
+  return analysisProgressMessageText(input);
 }
 
 function inputResolutionUserMessage(error) {
@@ -1147,7 +1156,16 @@ async function handleImageSelectionCallback(query, settings, user) {
       text: `Image ${imageIndex + 1} selected.`
     });
     await clearCallbackMarkup(query);
-    await sendSelectedImagePreview(chatId, selectionId, imageIndex, selectedImage);
+    const sentPreview = await sendSelectedImagePreview(chatId, selectionId, imageIndex, selectedImage);
+    const previewFileId = sentPreview?.photo?.at(-1)?.file_id || sentPreview?.document?.file_id || null;
+
+    if (previewFileId) {
+      selection.selectedTelegramFileIds = {
+        ...(selection.selectedTelegramFileIds || {}),
+        [imageIndex]: previewFileId
+      };
+    }
+
     return true;
   }
 
@@ -1167,6 +1185,7 @@ async function handleImageSelectionCallback(query, settings, user) {
       image: selectedImage,
       candidateCount: selection.images.length
     });
+    input.selectedTelegramFileId = selection.selectedTelegramFileIds?.[imageIndex] || null;
     imageSelections.delete(selectionId);
     await clearCallbackMarkup(query);
     await runResolvedAnalysis(selection.message, user, settings, input);

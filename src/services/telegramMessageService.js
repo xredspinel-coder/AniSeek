@@ -1,3 +1,20 @@
+export function analysisProgressMessageText(input = {}) {
+  if (input.autoSelectedSingleImage) {
+    return "Found one suitable image. Analyzing it now...";
+  }
+
+  if (
+    input.previewExtractionStatus === "success" &&
+    input.extractedImageUrl &&
+    input.sourceType &&
+    input.sourceType !== "direct_image_url"
+  ) {
+    return "Found a preview image from this link. Analyzing...";
+  }
+
+  return "Searching the scene...";
+}
+
 export async function withTemporaryMessage({ bot, chatId, text, enabled = true } = {}, work) {
   if (typeof work !== "function") {
     throw new TypeError("withTemporaryMessage requires a work callback.");

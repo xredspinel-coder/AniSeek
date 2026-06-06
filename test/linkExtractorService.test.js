@@ -4,7 +4,8 @@ import {
   filterAndRankDiscoveredImages,
   resolveTelegramPreviewFallback,
   resolveMaxDiscoveredImages,
-  selectAnalysisImage
+  selectAnalysisImage,
+  trustedLinkSelectionResult
 } from "../src/services/linkExtractorService.js";
 
 test("resolveMaxDiscoveredImages defaults and clamps dashboard values", () => {
@@ -188,6 +189,44 @@ test("resolveTelegramPreviewFallback uses Telegram web page preview image", asyn
   assert.equal(input.fallbackUsed, "telegram_preview");
   assert.equal(input.telegramPreviewUsed, true);
   assert.equal(input.sourceType, "telegram_link_preview");
+  assert.equal(input.inputTelegramFileId, "telegram-preview-file-id");
+  assert.equal(input.inputPreview, null);
   assert.equal(input.previewExtractionMethod, "telegram:web_page_preview:provider_blocked");
   assert.equal(input.imageUrl, "https://api.telegram.org/file/bot123456:test-token/photos/preview.jpg");
+});
+
+test("trustedLinkSelectionResult auto-selects one filtered image without selection buttons", () => {
+  const result = trustedLinkSelectionResult({
+    url: "https://example.test/post",
+    source: "generic",
+    sourceType: "generic_link_preview",
+    bestInput: {
+      imageUrl: "https://cdn.example.test/only.jpg"
+    },
+    images: [
+      { url: "https://cdn.example.test/only.jpg" }
+    ]
+  });
+
+  assert.equal(result.type, "input");
+  assert.equal(result.input.autoSelectedSingleImage, true);
+  assert.equal(result.input.imageUrl, "https://cdn.example.test/only.jpg");
+});
+
+test("trustedLinkSelectionResult keeps Trusted User buttons for multiple images", () => {
+  const result = trustedLinkSelectionResult({
+    url: "https://example.test/post",
+    source: "generic",
+    sourceType: "generic_link_preview",
+    bestInput: {
+      imageUrl: "https://cdn.example.test/best.jpg"
+    },
+    images: [
+      { url: "https://cdn.example.test/one.jpg" },
+      { url: "https://cdn.example.test/two.jpg" }
+    ]
+  });
+
+  assert.equal(result.type, "selection");
+  assert.equal(result.images.length, 2);
 });

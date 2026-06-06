@@ -1,5 +1,6 @@
 import { db, FieldValue } from "../firebaseAdmin.js";
 import { todayKey } from "./limitService.js";
+import { normalizeActivityForStorage } from "./activitySchema.js";
 
 const TECHNICAL_FAILURE_TYPES = new Set([
   "invalid_media",
@@ -17,58 +18,6 @@ const REJECTED_STATUSES = new Set(["rejected", "low_similarity"]);
 
 export function isTechnicalFailureType(type) {
   return TECHNICAL_FAILURE_TYPES.has(type);
-}
-
-function hasOwn(object, key) {
-  return Object.prototype.hasOwnProperty.call(object, key);
-}
-
-function firstPresent(...values) {
-  for (const value of values) {
-    if (typeof value === "string" && value.trim()) {
-      return value;
-    }
-
-    if (value !== null && value !== undefined && typeof value !== "string") {
-      return value;
-    }
-  }
-
-  return null;
-}
-
-function mediaValue(activity, key, ...fallbacks) {
-  const media = activity.media && typeof activity.media === "object" ? activity.media : null;
-
-  if (media && hasOwn(media, key)) {
-    return firstPresent(media[key]);
-  }
-
-  return firstPresent(...fallbacks);
-}
-
-function normalizeMedia(activity) {
-  return {
-    inputTelegramFileId: mediaValue(activity, "inputTelegramFileId", activity.inputTelegramFileId, activity.inputFileId),
-    sentPhotoFileId: mediaValue(activity, "sentPhotoFileId", activity.sentPhotoFileId),
-    sentVideoFileId: mediaValue(activity, "sentVideoFileId", activity.sentVideoFileId),
-    sentAnimationFileId: mediaValue(activity, "sentAnimationFileId", activity.sentAnimationFileId),
-    inputImageUrl: mediaValue(
-      activity,
-      "inputImageUrl",
-      activity.inputImageUrl,
-      activity.extractedImageUrl,
-      activity.inputPreview,
-      activity.inputThumbnail,
-      activity.inputUrl
-    ),
-    extractedImageUrl: mediaValue(activity, "extractedImageUrl", activity.extractedImageUrl),
-    inputTelegramFileUrl: mediaValue(activity, "inputTelegramFileUrl", activity.inputTelegramFileUrl),
-    resultImageUrl: mediaValue(activity, "resultImageUrl", activity.resultImageUrl, activity.botResponse?.imageUrl, activity.imageUrl),
-    resultVideoUrl: mediaValue(activity, "resultVideoUrl", activity.resultVideoUrl, activity.botResponse?.videoUrl, activity.videoUrl),
-    botVideoUrl: mediaValue(activity, "botVideoUrl", activity.botVideoUrl),
-    botImageUrl: mediaValue(activity, "botImageUrl", activity.botImageUrl)
-  };
 }
 
 function normalizeActivityBucket(status) {
@@ -107,58 +56,14 @@ export async function recordActivity(activity) {
     });
   }
 
-  const normalizedStatus = activity.status === "error" ? "failed" : activity.status;
-  const media = normalizeMedia(activity);
-  const payload = {
-    userId: String(activity.userId),
-    user: activity.user || null,
-    source: activity.source,
-    sourceType: activity.sourceType || activity.source || null,
-    inputUrl: activity.inputUrl || null,
-    extractedImageUrl: activity.extractedImageUrl || media.extractedImageUrl || null,
-    inputSourceDomain: activity.inputSourceDomain || null,
-    previewExtractionMethod: activity.previewExtractionMethod || null,
-    previewExtractionStatus: activity.previewExtractionStatus || null,
-    previewExtractionError: activity.previewExtractionError || null,
-    previewExtractionCandidateCount: activity.previewExtractionCandidateCount ?? null,
-    previewExtractionSelectedMimeType: activity.previewExtractionSelectedMimeType || null,
-    providerDiagnostics: activity.providerDiagnostics || null,
-    provider: activity.provider || activity.providerDiagnostics?.platform || null,
-    bestImageUrl: activity.bestImageUrl || null,
-    selectedImageUrl: activity.selectedImageUrl || activity.extractedImageUrl || media.extractedImageUrl || null,
-    imageCount: activity.imageCount ?? activity.previewExtractionCandidateCount ?? null,
-    filteredImageCount: activity.filteredImageCount ?? null,
-    previewFallbackUsed: activity.fallbackUsed || activity.previewFallbackUsed || null,
-    telegramPreviewUsed: Boolean(activity.telegramPreviewUsed || activity.fallbackUsed === "telegram_preview"),
-    inputType: activity.inputType || activity.source || null,
-    inputFileId: activity.inputFileId || null,
-    inputTelegramFileId: activity.inputTelegramFileId || media.inputTelegramFileId || null,
-    inputTelegramFileUrl: activity.inputTelegramFileUrl || media.inputTelegramFileUrl,
-    inputImageUrl: activity.inputImageUrl || media.inputImageUrl,
-    inputThumbnail: activity.inputThumbnail || null,
-    inputPreview: activity.inputPreview || media.inputImageUrl || null,
-    userInput: activity.userInput || null,
-    animeTitle: activity.animeTitle || null,
-    anilistId: activity.anilistId || null,
-    anilistUrl: activity.anilistUrl || null,
-    episode: activity.episode ?? null,
-    from: activity.from ?? null,
-    to: activity.to ?? null,
-    formattedTime: activity.formattedTime || null,
-    similarity: activity.similarity ?? null,
-    videoUrl: media.resultVideoUrl || activity.videoUrl || null,
-    imageUrl: media.resultImageUrl || activity.imageUrl || null,
-    media,
-    status: normalizedStatus || "success",
-    rejectionReason: activity.rejectionReason || null,
-    botResponse: activity.botResponse || null,
-    error: activity.error || null,
-    createdAt: FieldValue.serverTimestamp()
-  };
-
   const activityRef = activity.id
     ? db.collection("activities").doc(String(activity.id))
     : db.collection("activities").doc();
+  const serverTimestamp = FieldValue.serverTimestamp();
+  const payload = normalizeActivityForStorage(activity, {
+    id: activityRef.id,
+    timestamp: serverTimestamp
+  });
 
   await activityRef.set(payload);
   await updateDailyAnalytics(payload);
@@ -172,40 +77,17 @@ export async function recordActivity(activity) {
 }
 
 export async function recordError(error, { countAnalytics = true } = {}) {
-  const media = normalizeMedia(error);
+  const serverTimestamp = FieldValue.serverTimestamp();
   const payload = {
-    userId: error.userId ? String(error.userId) : null,
-    user: error.user || null,
-    source: error.source || null,
-    sourceType: error.sourceType || error.source || null,
-    inputUrl: error.inputUrl || null,
-    extractedImageUrl: error.extractedImageUrl || media.extractedImageUrl || null,
-    inputSourceDomain: error.inputSourceDomain || null,
-    previewExtractionMethod: error.previewExtractionMethod || null,
-    previewExtractionStatus: error.previewExtractionStatus || null,
-    previewExtractionError: error.previewExtractionError || null,
-    previewExtractionCandidateCount: error.previewExtractionCandidateCount ?? null,
-    previewExtractionSelectedMimeType: error.previewExtractionSelectedMimeType || null,
-    providerDiagnostics: error.providerDiagnostics || null,
-    provider: error.provider || error.providerDiagnostics?.platform || null,
-    bestImageUrl: error.bestImageUrl || null,
-    selectedImageUrl: error.selectedImageUrl || error.extractedImageUrl || media.extractedImageUrl || null,
-    imageCount: error.imageCount ?? error.previewExtractionCandidateCount ?? null,
-    filteredImageCount: error.filteredImageCount ?? null,
-    previewFallbackUsed: error.fallbackUsed || error.previewFallbackUsed || null,
-    telegramPreviewUsed: Boolean(error.telegramPreviewUsed || error.fallbackUsed === "telegram_preview"),
-    inputType: error.inputType || error.source || null,
-    inputFileId: error.inputFileId || null,
-    inputTelegramFileId: error.inputTelegramFileId || media.inputTelegramFileId || null,
-    userInput: error.userInput || null,
+    ...normalizeActivityForStorage({
+      ...error,
+      status: error.status || "failed"
+    }, {
+      timestamp: serverTimestamp
+    }),
     message: error.message || "Unknown error",
     failureType: error.failureType || error.rejectionReason || error.errorType || null,
-    status: error.status || "failed",
-    rejectionReason: error.rejectionReason || null,
-    media,
-    botResponse: error.botResponse || null,
-    stack: error.stack || null,
-    createdAt: FieldValue.serverTimestamp()
+    stack: error.stack || null
   };
 
   const errorRef = await db.collection("errors").add(payload);
@@ -239,14 +121,28 @@ export async function updateActivitySentMedia(activityId, sentMedia = {}) {
   [
     "sentPhotoFileId",
     "sentVideoFileId",
-    "sentAnimationFileId",
-    "botVideoUrl",
-    "botImageUrl"
+    "sentAnimationFileId"
   ].forEach((key) => {
     if (Object.prototype.hasOwnProperty.call(sentMedia, key)) {
       patch[`media.${key}`] = sentMedia[key] || null;
     }
   });
+
+  if (sentMedia.sentPhotoFileId) {
+    patch["media.dashboardImageFileId"] = sentMedia.sentPhotoFileId;
+  }
+
+  if (sentMedia.botImageUrl) {
+    patch["media.dashboardImageUrl"] = sentMedia.botImageUrl;
+  }
+
+  if (sentMedia.sentVideoFileId || sentMedia.sentAnimationFileId) {
+    patch["media.dashboardVideoFileId"] = sentMedia.sentVideoFileId || sentMedia.sentAnimationFileId;
+  }
+
+  if (sentMedia.botVideoUrl) {
+    patch["media.dashboardVideoUrl"] = sentMedia.botVideoUrl;
+  }
 
   await db.collection("activities").doc(String(activityId)).set(patch, { merge: true });
 }

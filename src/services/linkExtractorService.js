@@ -667,14 +667,21 @@ function urlInputPayload({
   fallbackUsed = null,
   bestImageUrl = null,
   filteredImageCount = null,
-  telegramPreviewUsed = false
+  telegramPreviewUsed = false,
+  telegramFileId = null,
+  telegramFileUrl = null,
+  selectedTelegramFileId = null,
+  autoSelectedSingleImage = false
 }) {
+  const hasTelegramFileId = Boolean(telegramFileId);
+  const persistentImageUrl = hasTelegramFileId ? null : imageUrl;
+
   return {
     source: sourceType,
     sourceType,
     inputType: sourceType,
     inputUrl: url,
-    extractedImageUrl: imageUrl,
+    extractedImageUrl: persistentImageUrl,
     inputSourceDomain: sourceDomain(url),
     previewExtractionMethod: method,
     previewExtractionStatus: "success",
@@ -683,15 +690,18 @@ function urlInputPayload({
     previewExtractionSelectedMimeType: mimeType || null,
     provider: providerDiagnostics?.platform || null,
     bestImageUrl: bestImageUrl || null,
-    selectedImageUrl: imageUrl,
+    selectedImageUrl: persistentImageUrl,
     imageCount: Number.isFinite(candidateCount) ? candidateCount : null,
     filteredImageCount: Number.isFinite(filteredImageCount) ? filteredImageCount : null,
     telegramPreviewUsed: Boolean(telegramPreviewUsed || fallbackUsed === "telegram_preview"),
-    inputFileId: null,
-    inputTelegramFileUrl: null,
-    inputImageUrl: imageUrl,
-    inputThumbnail: imageUrl,
-    inputPreview: imageUrl,
+    inputFileId: telegramFileId || null,
+    inputTelegramFileId: telegramFileId || null,
+    inputTelegramFileUrl: hasTelegramFileId ? null : telegramFileUrl || null,
+    inputImageUrl: persistentImageUrl,
+    inputThumbnail: persistentImageUrl,
+    inputPreview: persistentImageUrl,
+    selectedTelegramFileId,
+    autoSelectedSingleImage: Boolean(autoSelectedSingleImage),
     imageUrl,
     providerDiagnostics,
     fallbackUsed
@@ -826,7 +836,8 @@ export async function resolveTelegramPreviewFallback(message, bot, url, {
       fallbackUsed: "telegram_preview",
       bestImageUrl: metadata?.bestImage || null,
       filteredImageCount: filterAndRankDiscoveredImages(metadata || {}).length,
-      telegramPreviewUsed: true
+      telegramPreviewUsed: true,
+      telegramFileId: fileId
     });
   } catch (error) {
     logPreviewExtraction("warn", {
@@ -882,7 +893,8 @@ async function buildInputFromMetadataImage({
   candidateCount,
   fallbackUsed = null,
   filteredImageCount = null,
-  bestImageUrl = null
+  bestImageUrl = null,
+  autoSelectedSingleImage = false
 }) {
   const providerDiagnostics = providerDiagnosticsFromMetadata(metadata);
   const resolvedBestImageUrl = bestImageUrl || metadata?.bestImage || null;
@@ -918,7 +930,8 @@ async function buildInputFromMetadataImage({
       providerDiagnostics,
       fallbackUsed,
       bestImageUrl: resolvedBestImageUrl,
-      filteredImageCount: resolvedFilteredImageCount
+      filteredImageCount: resolvedFilteredImageCount,
+      autoSelectedSingleImage
     });
   } catch (error) {
     throw inputError("I found an image in that link, but could not load it safely. Send the image directly or try another link.", {
@@ -948,7 +961,8 @@ async function resolveMetadataBestInput(url, message, bot, settings, { trustedUs
   const metadata = await fetchMetaNovaMetadata(url, { sourceType, trustedUser });
   const selectedImage = selectAnalysisImage(metadata);
   const imageCount = Array.isArray(metadata.images) ? metadata.images.length : 0;
-  const filteredImageCount = filterAndRankDiscoveredImages(metadata).length;
+  const filteredImages = filterAndRankDiscoveredImages(metadata);
+  const filteredImageCount = filteredImages.length;
   const needsFallback = metadata.ok === false || isProviderBlocked(metadata) || !selectedImage;
 
   if (needsFallback) {
@@ -1176,6 +1190,30 @@ export function shouldOfferTrustedLinkSelection(message = {}) {
   return Boolean(url && !hasDirectTelegramImage(message) && !isDirectImageUrl(url));
 }
 
+export function trustedLinkSelectionResult({ url, source, sourceType, metadata, bestInput, images = [] } = {}) {
+  const safeImages = Array.isArray(images) ? images : [];
+
+  if (safeImages.length === 1) {
+    return {
+      type: "input",
+      input: {
+        ...bestInput,
+        autoSelectedSingleImage: true
+      }
+    };
+  }
+
+  return {
+    type: "selection",
+    url,
+    source,
+    sourceType,
+    metadata,
+    bestInput,
+    images: safeImages
+  };
+}
+
 export async function resolveTrustedLinkSelection(message, bot, settings, { trustedUser = false } = {}) {
   const [url] = extractUrls(message);
 
@@ -1219,7 +1257,8 @@ export async function resolveTrustedLinkSelection(message, bot, settings, { trus
       method: selectedImage.isBestImage ? METANOVA_BEST_IMAGE_METHOD : "metanova:vettedImage",
       candidateCount: imageCount || 1,
       filteredImageCount,
-      bestImageUrl: metadata.bestImage || null
+      bestImageUrl: metadata.bestImage || null,
+      autoSelectedSingleImage: filteredImageCount === 1
     });
   } catch (error) {
     const fallback = await resolveTelegramPreviewFallback(message, bot, url, {
@@ -1239,15 +1278,14 @@ export async function resolveTrustedLinkSelection(message, bot, settings, { trus
     throw error;
   }
 
-  return {
-    type: "selection",
+  return trustedLinkSelectionResult({
     url,
     source,
     sourceType,
     metadata,
     bestInput,
-    images: filterAndRankDiscoveredImages(metadata)
-  };
+    images: filteredImages
+  });
 }
 
 export async function resolveDiscoveredImageInput({ url, sourceType, metadata, image, candidateCount }) {

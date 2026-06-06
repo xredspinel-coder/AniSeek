@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { withTemporaryMessage } from "../src/services/telegramMessageService.js";
+import { analysisProgressMessageText, withTemporaryMessage } from "../src/services/telegramMessageService.js";
+
+test("analysisProgressMessageText uses the one-image auto-selection message", () => {
+  assert.equal(
+    analysisProgressMessageText({ autoSelectedSingleImage: true }),
+    "Found one suitable image. Analyzing it now..."
+  );
+});
 
 test("withTemporaryMessage deletes loading message after successful work", async () => {
   const calls = [];
