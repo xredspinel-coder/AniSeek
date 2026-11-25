@@ -15,7 +15,6 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "firebase-admin": "^13.0.2",
-    "metanova": "^0.2.2",
     "node-telegram-bot-api": "^0.66.0",
     "sharp": "^0.34.5"
   },

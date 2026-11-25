@@ -1,12 +1,18 @@
 import { lookup } from "node:dns/promises";
 import net from "node:net";
-import { fetchMetadata } from "metanova";
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { promisify } from "node:util";
 
 const IMAGE_EXTENSION_PATTERN = /\.(gif|jpe?g|png|webp)(?:[?#].*)?$/i;
+const execFileAsync = promisify(execFile);
+const GALLERY_DL_TIMEOUT_MS = 45_000;
+const MAX_GALLERY_DL_OUTPUT_BYTES = 5 * 1024 * 1024;
+const MAX_GALLERY_DL_CANDIDATES = 40;
 const URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 const MAX_IMAGE_BYTES = 8_000_000;
-const MAX_METADATA_BYTES = 1_000_000;
 const MAX_REDIRECTS = 5;
 const REQUEST_TIMEOUT_MS = 8_000;
 const TELEGRAM_FILE_TIMEOUT_MS = 12_000;
@@ -17,13 +23,15 @@ const BROWSER_USER_AGENT =
 const DIRECT_IMAGE_SOURCE_TYPE = "direct_image_url";
 const GENERIC_SOURCE_TYPE = "generic_link_preview";
 const TELEGRAM_PREVIEW_SOURCE_TYPE = "telegram_link_preview";
-const METANOVA_METHOD = "metanova:fetchMetadata";
-const METANOVA_BEST_IMAGE_METHOD = "metanova:bestImage";
+const GALLERY_DL_METHOD = "gallery-dl:get-urls";
+const GALLERY_DL_SELECTED_METHOD = "gallery-dl:selected-image";
 const TELEGRAM_PREVIEW_METHOD = "telegram:web_page_preview";
 const PLATFORM_SOURCE_TYPES = {
   reddit: "reddit_preview",
   twitter: "twitter_preview",
-  facebook: "facebook_preview"
+  facebook: "facebook_preview",
+  instagram: "instagram_gallery",
+  tiktok: "tiktok_gallery"
 };
 const WEAK_IMAGE_TEXT_PATTERN =
   /avatar|favicon|emoji|award|sprite|pixel|placeholder|community[-_\s]*icon|subreddit[-_\s]*icon|profile[-_\s]*(?:image|photo|picture)?|channel[-_\s]*icon|\bicon\b/i;
@@ -490,6 +498,14 @@ function classifyHost(url) {
     return "facebook";
   }
 
+  if (host === "instagram.com" || host.endsWith(".instagram.com") || host === "instagr.am") {
+    return "instagram";
+  }
+
+  if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
+    return "tiktok";
+  }
+
   return "direct_url";
 }
 
@@ -579,81 +595,133 @@ function resolveLinkSource(url, settings) {
   };
 }
 
-function metanovaFetchOptions() {
-  return {
-    timeoutMs: REQUEST_TIMEOUT_MS,
-    retries: 1,
-    retryDelayMs: 250,
-    maxRedirects: MAX_REDIRECTS,
-    maxBytes: MAX_METADATA_BYTES,
-    userAgent: BROWSER_USER_AGENT,
-    acceptLanguage: "en-US,en;q=0.9",
-    fetchOEmbed: true
-  };
+function galleryDlPythonPath() {
+  if (process.env.GALLERY_DL_PYTHON) {
+    return process.env.GALLERY_DL_PYTHON;
+  }
+
+  const localVenvPython = path.resolve(process.cwd(), ".venv", "bin", "python");
+  if (existsSync(localVenvPython)) {
+    return localVenvPython;
+  }
+
+  const localWindowsVenvPython = path.resolve(process.cwd(), ".venv", "Scripts", "python.exe");
+  if (existsSync(localWindowsVenvPython)) {
+    return localWindowsVenvPython;
+  }
+
+  return process.platform === "win32" ? "python" : "python3";
 }
 
-async function fetchMetaNovaMetadata(url, { sourceType, trustedUser = false } = {}) {
-  let metadata;
-
+async function fetchGalleryDlMetadata(url, { sourceType, trustedUser = false } = {}) {
   try {
-    metadata = await fetchMetadata(url, metanovaFetchOptions());
+    // Validate the submitted URL before passing it to an external extractor process.
+    await validateSafePublicUrl(url);
+
+    const galleryDlArgs = ["-m", "gallery_dl", "--get-urls", "--quiet"];
+    if (process.env.GALLERY_DL_COOKIES_FILE) {
+      galleryDlArgs.push("--cookies", process.env.GALLERY_DL_COOKIES_FILE);
+    }
+    galleryDlArgs.push(url);
+
+    let stdout = "";
+    try {
+      const result = await execFileAsync(
+        galleryDlPythonPath(),
+        galleryDlArgs,
+        {
+          timeout: GALLERY_DL_TIMEOUT_MS,
+          maxBuffer: MAX_GALLERY_DL_OUTPUT_BYTES,
+          windowsHide: true,
+          encoding: "utf8"
+        }
+      );
+      stdout = result.stdout;
+    } catch (error) {
+      // Keep URLs already emitted if an extractor exits non-zero after a partial result.
+      if (typeof error.stdout !== "string" || !error.stdout.trim()) {
+        throw error;
+      }
+      stdout = error.stdout;
+    }
+
+    const candidates = [...new Set(String(stdout || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => /^https?:\/\//i.test(line)))]
+      .slice(0, MAX_GALLERY_DL_CANDIDATES);
+
+    // gallery-dl can return videos as well as images. Validate the actual response
+    // MIME type instead of trusting the URL extension.
+    const images = [];
+    for (let index = 0; index < candidates.length; index += 4) {
+      const batch = candidates.slice(index, index + 4);
+      const validated = await Promise.all(batch.map(async (imageUrl) => {
+        try {
+          const image = await probeImageUrl(imageUrl);
+          return { url: image.url, source: "gallery-dl", mimeType: image.mimeType };
+        } catch {
+          return null;
+        }
+      }));
+      images.push(...validated.filter(Boolean));
+    }
+
+    const metadata = {
+      ok: images.length > 0,
+      images,
+      bestImage: images[0]?.url || null,
+      diagnostics: {
+        adapterUsed: "gallery-dl",
+        errors: images.length ? [] : [candidates.length ? "No supported image files were found." : "gallery-dl returned no media URLs."]
+      }
+    };
+
+    logPreviewExtraction(images.length ? "info" : "warn", {
+      url,
+      sourceType,
+      extractorUsed: GALLERY_DL_METHOD,
+      candidateCount: candidates.length,
+      imageCount: images.length,
+      filteredImageCount: images.length,
+      bestImage: metadata.bestImage,
+      selectedImage: metadata.bestImage,
+      selectedImageUrl: metadata.bestImage,
+      provider: "gallery-dl",
+      status: metadata.ok ? "success" : "failed",
+      trustedUser,
+      failureReason: metadata.ok ? null : metadata.diagnostics.errors[0]
+    });
+
+    return metadata;
   } catch (error) {
+    const reason = error.code === "ENOENT"
+      ? "gallery-dl or Python is not installed. Check the Render build command."
+      : error.killed || error.code === "ETIMEDOUT"
+        ? "gallery-dl timed out while extracting this post."
+        : error.message;
+
     logPreviewExtraction("warn", {
       url,
       sourceType,
-      extractorUsed: METANOVA_METHOD,
+      extractorUsed: GALLERY_DL_METHOD,
       candidateCount: 0,
       status: "failed",
       trustedUser,
-      failureReason: error.message,
+      failureReason: reason,
       errorStack: error.stack
     });
 
-    throw inputError("I could not open this link. Try another link or send the image directly.", {
-      status: "failed",
-      rejectionReason: /not allowed|localhost|private|internal|credentials|valid|protocol/i.test(error.message)
-        ? "invalid_url"
-        : "metadata_fetch_error",
-      source: sourceType,
-      sourceType,
-      inputUrl: url,
-      previewExtractionMethod: METANOVA_METHOD,
-      previewExtractionError: error.message,
-      previewExtractionCandidateCount: 0
-    });
+    return {
+      ok: false,
+      images: [],
+      bestImage: null,
+      diagnostics: {
+        adapterUsed: "gallery-dl",
+        errors: [reason]
+      }
+    };
   }
-
-  const providerDiagnostics = providerDiagnosticsFromMetadata(metadata);
-  const blocked = isProviderBlocked(metadata);
-  const candidateCount = Array.isArray(metadata.images) ? metadata.images.length : 0;
-  const rankedImages = filterAndRankDiscoveredImages(metadata);
-  const selectedAnalysisImage = selectAnalysisImage(metadata);
-  const failureReason = !metadata.ok
-    ? metadataErrors(metadata).join("; ") || "metanova_not_ok"
-    : blocked
-      ? providerDiagnostics?.reason || "provider_blocked"
-      : selectedAnalysisImage
-        ? null
-        : "no_usable_image";
-
-  logPreviewExtraction(failureReason ? "warn" : "info", {
-    url,
-    sourceType,
-    extractorUsed: METANOVA_METHOD,
-    candidateCount,
-    imageCount: candidateCount,
-    filteredImageCount: rankedImages.length,
-    bestImage: metadata.bestImage || null,
-    selectedImage: selectedAnalysisImage?.url || null,
-    selectedImageUrl: selectedAnalysisImage?.url || metadata.bestImage || null,
-    provider: providerDiagnostics?.platform || metadata.diagnostics?.adapterUsed || metadata.diagnostics?.adapter?.name || metadata.siteName || null,
-    status: metadata.ok ? "success" : "failed",
-    trustedUser,
-    providerDiagnostics,
-    failureReason
-  });
-
-  return metadata;
 }
 
 function urlInputPayload({
@@ -877,7 +945,7 @@ function metadataUnavailableError(url, metadata, sourceType) {
     source: sourceType,
     sourceType,
     inputUrl: url,
-    previewExtractionMethod: METANOVA_METHOD,
+    previewExtractionMethod: GALLERY_DL_METHOD,
     previewExtractionError: errors.join("; ") || providerDiagnostics?.reason || message,
     previewExtractionCandidateCount: Array.isArray(metadata?.images) ? metadata.images.length : 0,
     providerDiagnostics
@@ -958,7 +1026,7 @@ async function buildInputFromMetadataImage({
 
 async function resolveMetadataBestInput(url, message, bot, settings, { trustedUser = false } = {}) {
   const { sourceType } = resolveLinkSource(url, settings);
-  const metadata = await fetchMetaNovaMetadata(url, { sourceType, trustedUser });
+  const metadata = await fetchGalleryDlMetadata(url, { sourceType, trustedUser });
   const selectedImage = selectAnalysisImage(metadata);
   const imageCount = Array.isArray(metadata.images) ? metadata.images.length : 0;
   const filteredImages = filterAndRankDiscoveredImages(metadata);
@@ -986,7 +1054,7 @@ async function resolveMetadataBestInput(url, message, bot, settings, { trustedUs
       imageUrl: selectedImage.url,
       sourceType,
       metadata,
-      method: selectedImage.isBestImage ? METANOVA_BEST_IMAGE_METHOD : "metanova:vettedImage",
+      method: GALLERY_DL_SELECTED_METHOD,
       candidateCount: imageCount || 1,
       filteredImageCount,
       bestImageUrl: metadata.bestImage || null
@@ -1172,10 +1240,10 @@ export function filterAndRankDiscoveredImages(metadata = {}) {
 
 export function selectAnalysisImage(metadata = {}) {
   const candidates = normalizedImageCandidates(metadata);
-  const metaNovaBest = candidates.find((image) => image.isBestImage);
+  const firstBest = candidates.find((image) => image.isBestImage);
 
-  if (metaNovaBest && isUsefulImage(metaNovaBest)) {
-    return metaNovaBest;
+  if (firstBest && isUsefulImage(firstBest)) {
+    return firstBest;
   }
 
   return filterAndRankDiscoveredImages(metadata)[0] || null;
@@ -1222,10 +1290,11 @@ export async function resolveTrustedLinkSelection(message, bot, settings, { trus
   }
 
   const { source, sourceType } = resolveLinkSource(url, settings);
-  const metadata = await fetchMetaNovaMetadata(url, { sourceType, trustedUser });
+  const metadata = await fetchGalleryDlMetadata(url, { sourceType, trustedUser });
   const selectedImage = selectAnalysisImage(metadata);
   const imageCount = Array.isArray(metadata.images) ? metadata.images.length : 0;
-  const filteredImageCount = filterAndRankDiscoveredImages(metadata).length;
+  const filteredImages = filterAndRankDiscoveredImages(metadata);
+  const filteredImageCount = filteredImages.length;
   const needsFallback = metadata.ok === false || isProviderBlocked(metadata) || !selectedImage;
 
   if (needsFallback) {
@@ -1254,7 +1323,7 @@ export async function resolveTrustedLinkSelection(message, bot, settings, { trus
       imageUrl: selectedImage.url,
       sourceType,
       metadata,
-      method: selectedImage.isBestImage ? METANOVA_BEST_IMAGE_METHOD : "metanova:vettedImage",
+      method: GALLERY_DL_SELECTED_METHOD,
       candidateCount: imageCount || 1,
       filteredImageCount,
       bestImageUrl: metadata.bestImage || null,
@@ -1294,7 +1363,7 @@ export async function resolveDiscoveredImageInput({ url, sourceType, metadata, i
     imageUrl: image.url,
     sourceType,
     metadata,
-    method: `metanova:selectedImage:${image.source || "image"}`,
+    method: GALLERY_DL_SELECTED_METHOD,
     candidateCount
   });
 }

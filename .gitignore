@@ -141,3 +141,8 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Python virtual environment used by gallery-dl on Render
+.venv/
+__pycache__/
+*.py[cod]
