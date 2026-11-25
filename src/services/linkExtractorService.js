@@ -7,7 +7,11 @@ import { promisify } from "node:util";
 
 const IMAGE_EXTENSION_PATTERN = /\.(gif|jpe?g|png|webp)(?:[?#].*)?$/i;
 const execFileAsync = promisify(execFile);
-const GALLERY_DL_TIMEOUT_MS = 45_000;
+const DEFAULT_GALLERY_DL_TIMEOUT_MS = 120_000;
+const configuredGalleryDlTimeout = Number.parseInt(process.env.GALLERY_DL_TIMEOUT_MS || "", 10);
+const GALLERY_DL_TIMEOUT_MS = Number.isFinite(configuredGalleryDlTimeout)
+  ? Math.max(45_000, Math.min(configuredGalleryDlTimeout, 300_000))
+  : DEFAULT_GALLERY_DL_TIMEOUT_MS;
 const MAX_GALLERY_DL_OUTPUT_BYTES = 5 * 1024 * 1024;
 const MAX_GALLERY_DL_CANDIDATES = 40;
 const URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
