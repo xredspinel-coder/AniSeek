@@ -8,7 +8,7 @@ AniSeekBot is the Telegram webhook service for AniSeek. It is intentionally inde
 - Express webhook server
 - node-telegram-bot-api without polling
 - Firebase Admin SDK
-- gallery-dl (Python) for extracting image URLs from supported social posts
+- Native Node.js HTTP extractors for Reddit, X, Instagram, TikTok, and Facebook
 - trace.moe for scene recognition
 - AniList GraphQL for the real anime title from the `anilist` id
 
@@ -48,18 +48,18 @@ Expose the bot with a public URL, set `BASE_URL`, then run:
 npm run set:webhook
 ```
 
-The bot never starts polling. Social post images are extracted by invoking `gallery-dl` as a child process; MetaNova is no longer required.
+The bot never starts polling. Social post images are extracted directly with Node.js `fetch` and platform response parsing. No Python runtime or external downloader process is used.
 
 ## Deployment
 
-Deploy this folder by itself. Keep your existing Render Root Directory and Start Command. Update only the Build Command so gallery-dl is installed into a local Python virtual environment:
+Deploy this folder by itself. Keep your existing Render Root Directory and Start Command. Use the normal Node.js build command:
 
 ```text
-Build Command: npm install && python3 -m venv .venv && .venv/bin/pip install --no-cache-dir gallery-dl
+Build Command: npm install
 Start Command: npm run start
 ```
 
-No new Render environment variables are required for the default setup. The extractor automatically uses `.venv/bin/python`. `GALLERY_DL_PYTHON` is an optional override only if your Python executable is installed elsewhere. Some platforms (notably Instagram, TikTok, Facebook, X/Twitter, and Reddit) may require authentication cookies; if needed, add a Render Secret File in Netscape cookies format and set `GALLERY_DL_COOKIES_FILE` to its path. Do not paste session cookies into source code or commit them.
+No Python installation, virtual environment, gallery-dl package, or extractor-specific environment variables are required. Some platform endpoints are unofficial and may change or require authentication; failures are logged under `[preview-extractor]`.
 
 The dashboard is not required on the bot host.
 

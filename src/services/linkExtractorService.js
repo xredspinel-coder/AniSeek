@@ -1,19 +1,8 @@
 import { lookup } from "node:dns/promises";
 import net from "node:net";
-import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
-import path from "node:path";
-import { promisify } from "node:util";
 
 const IMAGE_EXTENSION_PATTERN = /\.(gif|jpe?g|png|webp)(?:[?#].*)?$/i;
-const execFileAsync = promisify(execFile);
-const DEFAULT_GALLERY_DL_TIMEOUT_MS = 120_000;
-const configuredGalleryDlTimeout = Number.parseInt(process.env.GALLERY_DL_TIMEOUT_MS || "", 10);
-const GALLERY_DL_TIMEOUT_MS = Number.isFinite(configuredGalleryDlTimeout)
-  ? Math.max(45_000, Math.min(configuredGalleryDlTimeout, 300_000))
-  : DEFAULT_GALLERY_DL_TIMEOUT_MS;
-const MAX_GALLERY_DL_OUTPUT_BYTES = 5 * 1024 * 1024;
-const MAX_GALLERY_DL_CANDIDATES = 40;
+const MAX_DIRECT_EXTRACTOR_CANDIDATES = 40;
 const URL_PATTERN = /https?:\/\/[^\s<>"']+/gi;
 const ALLOWED_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 const MAX_IMAGE_BYTES = 8_000_000;
@@ -27,8 +16,8 @@ const BROWSER_USER_AGENT =
 const DIRECT_IMAGE_SOURCE_TYPE = "direct_image_url";
 const GENERIC_SOURCE_TYPE = "generic_link_preview";
 const TELEGRAM_PREVIEW_SOURCE_TYPE = "telegram_link_preview";
-const GALLERY_DL_METHOD = "gallery-dl:get-urls";
-const GALLERY_DL_SELECTED_METHOD = "gallery-dl:selected-image";
+const DIRECT_EXTRACTOR_METHOD = "direct-http:platform-extractors";
+const DIRECT_EXTRACTOR_SELECTED_METHOD = "direct-http:selected-image";
 const TELEGRAM_PREVIEW_METHOD = "telegram:web_page_preview";
 const PLATFORM_SOURCE_TYPES = {
   reddit: "reddit_preview",
@@ -599,131 +588,215 @@ function resolveLinkSource(url, settings) {
   };
 }
 
-function galleryDlPythonPath() {
-  if (process.env.GALLERY_DL_PYTHON) {
-    return process.env.GALLERY_DL_PYTHON;
-  }
 
-  const localVenvPython = path.resolve(process.cwd(), ".venv", "bin", "python");
-  if (existsSync(localVenvPython)) {
-    return localVenvPython;
-  }
-
-  const localWindowsVenvPython = path.resolve(process.cwd(), ".venv", "Scripts", "python.exe");
-  if (existsSync(localWindowsVenvPython)) {
-    return localWindowsVenvPython;
-  }
-
-  return process.platform === "win32" ? "python" : "python3";
+function decodeHtml(value = "") {
+  return String(value).replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
 }
 
-async function fetchGalleryDlMetadata(url, { sourceType, trustedUser = false } = {}) {
+function uniqueUrls(values) {
+  return [...new Set(values.map((value) => decodeHtml(value).replace(/\\u0026/g, "&")).filter((value) => /^https?:\/\//i.test(value)))];
+}
+
+function collectImageUrls(value, output = []) {
+  if (!value) return output;
+  if (typeof value === "string") {
+    if (/^https?:\/\//i.test(value) && /\.(?:jpe?g|png|webp)(?:[?#]|$)/i.test(value)) output.push(value);
+    return output;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectImageUrls(item, output);
+    return output;
+  }
+  if (typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      if (/^(display_url|image_url|imageUrl|url|src|original|download_url)$/i.test(key)) collectImageUrls(child, output);
+      else if (child && typeof child === "object") collectImageUrls(child, output);
+    }
+  }
+  return output;
+}
+
+async function fetchText(url, headers = {}) {
+  const { response } = await safeFetchWithRedirects(url, {
+    headers: {
+      "User-Agent": BROWSER_USER_AGENT,
+      Accept: "text/html,application/json;q=0.9,*/*;q=0.8",
+      ...headers
+    }
+  }, { timeoutMs: 12_000 });
+  if (!response.ok) {
+    await cancelBody(response);
+    throw new Error(`Source returned HTTP ${response.status}.`);
+  }
+  const text = await response.text();
+  if (text.length > 8_000_000) throw new Error("Source page is too large to parse.");
+  return text;
+}
+
+function imageUrlsFromHtml(html) {
+  const urls = [];
+  const patterns = [
+    /<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]+content=["']([^"']+)["']/gi,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:image|twitter:image)["']/gi,
+    /"display_url"\s*:\s*"([^"]+)"/g,
+    /"image_url"\s*:\s*"([^"]+)"/g,
+    /"thumbnail_url"\s*:\s*"([^"]+)"/g
+  ];
+  for (const pattern of patterns) {
+    for (const match of html.matchAll(pattern)) urls.push(match[1].replace(/\\u0026/g, "&").replace(/\\\//g, "/"));
+  }
+  return uniqueUrls(urls);
+}
+
+function parseJsonScripts(html) {
+  const values = [];
+  for (const match of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try { values.push(JSON.parse(match[1])); } catch {}
+  }
+  for (const marker of ["window._sharedData =", "window.__INITIAL_STATE__ =", "SIGI_STATE ="]) {
+    const index = html.indexOf(marker);
+    if (index < 0) continue;
+    const tail = html.slice(index + marker.length);
+    const begin = tail.indexOf("{");
+    if (begin < 0) continue;
+    let depth = 0, quoted = false, escaped = false, finish = -1;
+    for (let i = begin; i < tail.length; i++) {
+      const c = tail[i];
+      if (quoted) { if (escaped) escaped = false; else if (c === "\\") escaped = true; else if (c === '"') quoted = false; continue; }
+      if (c === '"') quoted = true;
+      else if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) { finish = i + 1; break; }
+    }
+    if (finish > 0) { try { values.push(JSON.parse(tail.slice(begin, finish))); } catch {} }
+  }
+  return values;
+}
+
+function extractRedditPostId(url) {
+  const match = new URL(url).pathname.match(/\/comments\/([a-z0-9]+)/i);
+  return match?.[1] || null;
+}
+
+async function extractReddit(url) {
+  // Reddit share URLs (/u/name/s/...) may redirect to the canonical /comments/id/ URL.
+  const initial = await safeFetchWithRedirects(url, {
+    headers: { "User-Agent": BROWSER_USER_AGENT, Accept: "text/html,application/json;q=0.9,*/*;q=0.8" }
+  }, { timeoutMs: 12_000 });
+  const resolvedUrl = initial.finalUrl || url;
+  await cancelBody(initial.response);
+  const parsed = new URL(resolvedUrl);
+  const canonicalPath = parsed.pathname.replace(/\/$/, "");
+  const canonical = `https://www.reddit.com${canonicalPath}.json?raw_json=1`;
+  const json = await fetchText(canonical, { Accept: "application/json" });
+  const data = JSON.parse(json);
+  const post = data?.[0]?.data?.children?.[0]?.data || data?.data?.children?.[0]?.data;
+  if (!post) throw new Error("Reddit did not return a post. Profile/share links may not identify a post.");
+  const urls = [];
+  if (Array.isArray(post.gallery_data?.items)) {
+    for (const item of post.gallery_data.items) {
+      const media = post.media_metadata?.[item.media_id];
+      const source = media?.s?.u || media?.s?.gif || media?.s?.mp4;
+      if (typeof source === "string" && /\.(?:jpe?g|png|webp)(?:[?#]|$)/i.test(source)) urls.push(decodeHtml(source));
+    }
+  }
+  if (!urls.length && post.url_overridden_by_dest) urls.push(post.url_overridden_by_dest);
+  if (!urls.length && post.preview?.images) urls.push(...post.preview.images.map((item) => item?.source?.url).filter(Boolean));
+  return uniqueUrls(urls);
+}
+
+async function extractTwitter(url) {
+  const parsed = new URL(url);
+  const statusId = parsed.pathname.match(/status\/(\d+)/)?.[1];
+  const username = parsed.pathname.split("/").filter(Boolean)[0];
+  if (!statusId || !username) throw new Error("Could not identify the X post ID.");
+  const api = `https://api.fxtwitter.com/${encodeURIComponent(username)}/status/${statusId}`;
+  const payload = JSON.parse(await fetchText(api, { Accept: "application/json" }));
+  const photos = payload?.tweet?.media?.photos || payload?.media?.photos || [];
+  return uniqueUrls(photos.map((photo) => photo.url || photo.src).filter(Boolean));
+}
+
+async function extractInstagram(url) {
+  const parsed = new URL(url);
+  const shortcode = parsed.pathname.match(/\/(?:p|reel|tv)\/([^/]+)/)?.[1];
+  if (!shortcode) throw new Error("Could not identify an Instagram post shortcode.");
+  const canonical = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
+  let html;
+  try { html = await fetchText(canonical, { "X-IG-App-ID": "936619743392459" }); }
+  catch { html = await fetchText(`https://www.instagram.com/p/${shortcode}/`); }
+  const urls = imageUrlsFromHtml(html);
+  for (const state of parseJsonScripts(html)) collectImageUrls(state, urls);
+  return uniqueUrls(urls).filter((image) => /cdninstagram|fbcdn|instagram/i.test(new URL(image).hostname) || /\.(?:jpe?g|png|webp)(?:[?#]|$)/i.test(image));
+}
+
+async function extractTikTok(url) {
+  const html = await fetchText(url);
+  const urls = imageUrlsFromHtml(html);
+  for (const state of parseJsonScripts(html)) collectImageUrls(state, urls);
+  const decoded = html.replace(/\\u002F/g, "/").replace(/\\u0026/g, "&").replace(/\\\//g, "/");
+  for (const match of decoded.matchAll(/"urlList"\s*:\s*\[\s*"([^"]+)"/g)) urls.push(match[1]);
+  return uniqueUrls(urls).filter((image) => /\.(?:jpe?g|png|webp)(?:[?#]|$)/i.test(image) || /tiktokcdn|ibytedtos/i.test(new URL(image).hostname));
+}
+
+async function extractFacebook(url) {
+  const html = await fetchText(url);
+  const urls = imageUrlsFromHtml(html);
+  for (const state of parseJsonScripts(html)) collectImageUrls(state, urls);
+  return uniqueUrls(urls);
+}
+
+async function fetchDirectExtractorMetadata(url, { sourceType, trustedUser = false } = {}) {
+  let source;
+  try { source = classifyHost(url); } catch { source = "direct_url"; }
   try {
-    // Validate the submitted URL before passing it to an external extractor process.
     await validateSafePublicUrl(url);
-
-    const galleryDlArgs = ["-m", "gallery_dl", "--get-urls", "--quiet"];
-    if (process.env.GALLERY_DL_COOKIES_FILE) {
-      galleryDlArgs.push("--cookies", process.env.GALLERY_DL_COOKIES_FILE);
+    let candidates = [];
+    if (source === "reddit") candidates = await extractReddit(url);
+    else if (source === "twitter") candidates = await extractTwitter(url);
+    else if (source === "instagram") candidates = await extractInstagram(url);
+    else if (source === "tiktok") candidates = await extractTikTok(url);
+    else if (source === "facebook") candidates = await extractFacebook(url);
+    else {
+      const html = await fetchText(url);
+      candidates = imageUrlsFromHtml(html);
     }
-    galleryDlArgs.push(url);
-
-    let stdout = "";
-    try {
-      const result = await execFileAsync(
-        galleryDlPythonPath(),
-        galleryDlArgs,
-        {
-          timeout: GALLERY_DL_TIMEOUT_MS,
-          maxBuffer: MAX_GALLERY_DL_OUTPUT_BYTES,
-          windowsHide: true,
-          encoding: "utf8"
-        }
-      );
-      stdout = result.stdout;
-    } catch (error) {
-      // Keep URLs already emitted if an extractor exits non-zero after a partial result.
-      if (typeof error.stdout !== "string" || !error.stdout.trim()) {
-        throw error;
-      }
-      stdout = error.stdout;
-    }
-
-    const candidates = [...new Set(String(stdout || "")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => /^https?:\/\//i.test(line)))]
-      .slice(0, MAX_GALLERY_DL_CANDIDATES);
-
-    // gallery-dl can return videos as well as images. Validate the actual response
-    // MIME type instead of trusting the URL extension.
+    candidates = uniqueUrls(candidates).slice(0, MAX_DIRECT_EXTRACTOR_CANDIDATES);
     const images = [];
     for (let index = 0; index < candidates.length; index += 4) {
-      const batch = candidates.slice(index, index + 4);
-      const validated = await Promise.all(batch.map(async (imageUrl) => {
+      const checked = await Promise.all(candidates.slice(index, index + 4).map(async (imageUrl) => {
         try {
-          const image = await probeImageUrl(imageUrl);
-          return { url: image.url, source: "gallery-dl", mimeType: image.mimeType };
-        } catch {
-          return null;
-        }
+          const result = await probeImageUrl(imageUrl);
+          return { url: result.url, source: `${source}:direct`, mimeType: result.mimeType };
+        } catch { return null; }
       }));
-      images.push(...validated.filter(Boolean));
+      images.push(...checked.filter(Boolean));
     }
-
     const metadata = {
       ok: images.length > 0,
       images,
       bestImage: images[0]?.url || null,
       diagnostics: {
-        adapterUsed: "gallery-dl",
-        errors: images.length ? [] : [candidates.length ? "No supported image files were found." : "gallery-dl returned no media URLs."]
+        adapterUsed: `${source}:direct-http`,
+        errors: images.length ? [] : ["No public image URLs were found in the platform response."]
       }
     };
-
     logPreviewExtraction(images.length ? "info" : "warn", {
-      url,
-      sourceType,
-      extractorUsed: GALLERY_DL_METHOD,
-      candidateCount: candidates.length,
-      imageCount: images.length,
-      filteredImageCount: images.length,
-      bestImage: metadata.bestImage,
-      selectedImage: metadata.bestImage,
-      selectedImageUrl: metadata.bestImage,
-      provider: "gallery-dl",
-      status: metadata.ok ? "success" : "failed",
-      trustedUser,
+      url, sourceType, extractorUsed: `${source}:direct-http`,
+      candidateCount: candidates.length, imageCount: images.length,
+      filteredImageCount: images.length, bestImage: metadata.bestImage,
+      selectedImage: metadata.bestImage, provider: source,
+      status: metadata.ok ? "success" : "failed", trustedUser,
       failureReason: metadata.ok ? null : metadata.diagnostics.errors[0]
     });
-
     return metadata;
   } catch (error) {
-    const reason = error.code === "ENOENT"
-      ? "gallery-dl or Python is not installed. Check the Render build command."
-      : error.killed || error.code === "ETIMEDOUT"
-        ? "gallery-dl timed out while extracting this post."
-        : error.message;
-
     logPreviewExtraction("warn", {
-      url,
-      sourceType,
-      extractorUsed: GALLERY_DL_METHOD,
-      candidateCount: 0,
-      status: "failed",
-      trustedUser,
-      failureReason: reason,
-      errorStack: error.stack
+      url, sourceType, extractorUsed: `${source}:direct-http`,
+      candidateCount: 0, status: "failed", trustedUser,
+      failureReason: error.message, errorStack: error.stack
     });
-
     return {
-      ok: false,
-      images: [],
-      bestImage: null,
-      diagnostics: {
-        adapterUsed: "gallery-dl",
-        errors: [reason]
-      }
+      ok: false, images: [], bestImage: null,
+      diagnostics: { adapterUsed: `${source}:direct-http`, errors: [error.message] }
     };
   }
 }
@@ -839,7 +912,7 @@ function largestTelegramPhoto(value) {
 }
 
 function telegramPreviewFileId(message = {}) {
-  const page = message.web_page || message.webPage || null;
+  const page = message.web_page || message.webPage || message.web_page_preview || message.webPagePreview || null;
 
   if (!page || typeof page !== "object") {
     return null;
@@ -949,7 +1022,7 @@ function metadataUnavailableError(url, metadata, sourceType) {
     source: sourceType,
     sourceType,
     inputUrl: url,
-    previewExtractionMethod: GALLERY_DL_METHOD,
+    previewExtractionMethod: DIRECT_EXTRACTOR_METHOD,
     previewExtractionError: errors.join("; ") || providerDiagnostics?.reason || message,
     previewExtractionCandidateCount: Array.isArray(metadata?.images) ? metadata.images.length : 0,
     providerDiagnostics
@@ -1030,7 +1103,7 @@ async function buildInputFromMetadataImage({
 
 async function resolveMetadataBestInput(url, message, bot, settings, { trustedUser = false } = {}) {
   const { sourceType } = resolveLinkSource(url, settings);
-  const metadata = await fetchGalleryDlMetadata(url, { sourceType, trustedUser });
+  const metadata = await fetchDirectExtractorMetadata(url, { sourceType, trustedUser });
   const selectedImage = selectAnalysisImage(metadata);
   const imageCount = Array.isArray(metadata.images) ? metadata.images.length : 0;
   const filteredImages = filterAndRankDiscoveredImages(metadata);
@@ -1058,7 +1131,7 @@ async function resolveMetadataBestInput(url, message, bot, settings, { trustedUs
       imageUrl: selectedImage.url,
       sourceType,
       metadata,
-      method: GALLERY_DL_SELECTED_METHOD,
+      method: DIRECT_EXTRACTOR_SELECTED_METHOD,
       candidateCount: imageCount || 1,
       filteredImageCount,
       bestImageUrl: metadata.bestImage || null
@@ -1294,7 +1367,7 @@ export async function resolveTrustedLinkSelection(message, bot, settings, { trus
   }
 
   const { source, sourceType } = resolveLinkSource(url, settings);
-  const metadata = await fetchGalleryDlMetadata(url, { sourceType, trustedUser });
+  const metadata = await fetchDirectExtractorMetadata(url, { sourceType, trustedUser });
   const selectedImage = selectAnalysisImage(metadata);
   const imageCount = Array.isArray(metadata.images) ? metadata.images.length : 0;
   const filteredImages = filterAndRankDiscoveredImages(metadata);
@@ -1327,7 +1400,7 @@ export async function resolveTrustedLinkSelection(message, bot, settings, { trus
       imageUrl: selectedImage.url,
       sourceType,
       metadata,
-      method: GALLERY_DL_SELECTED_METHOD,
+      method: DIRECT_EXTRACTOR_SELECTED_METHOD,
       candidateCount: imageCount || 1,
       filteredImageCount,
       bestImageUrl: metadata.bestImage || null,
@@ -1367,7 +1440,7 @@ export async function resolveDiscoveredImageInput({ url, sourceType, metadata, i
     imageUrl: image.url,
     sourceType,
     metadata,
-    method: GALLERY_DL_SELECTED_METHOD,
+    method: DIRECT_EXTRACTOR_SELECTED_METHOD,
     candidateCount
   });
 }
